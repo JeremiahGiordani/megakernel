@@ -4,6 +4,8 @@
 #include "weight_packing.hpp"
 #include "epilogue.hpp"
 #include "conv_microkernels.hpp"
+#include "fused_conv_chain.hpp"
+#include <omp.h>
 
 #include <algorithm>
 #include <cassert>
@@ -23,6 +25,15 @@ static inline int64_t conv_out_dim(int64_t in, int64_t pad, int64_t dilation,
 }
 
 struct MaxShape { int C, H, W; };
+
+static int threads_from_env_default_1() {
+    const char* s = std::getenv("OMP_NUM_THREADS");
+    if (!s || !*s) return 1;
+    char* end = nullptr;
+    long v = std::strtol(s, &end, 10);
+    if (end == s || v <= 0 || v > 1024) return 1;
+    return (int)v;
+}
 
 
 // NCHW -> NCHWc (vec=16), N=1
@@ -226,6 +237,9 @@ void MegakernelModel::run(const float* input_nchw, int N, int C, int H, int W,
 
     const int vec = 16;
 
+    const char* env = std::getenv("OMP_NUM_THREADS");
+    int nt       = env ? std::atoi(env) : omp_get_max_threads();
+
     // Allocate two NCHWc work buffers sized to the **max** intermediate
     int maxC = C, maxH = H, maxW = W;
     int curC = C, curH = H, curW = W;
@@ -253,6 +267,25 @@ void MegakernelModel::run(const float* input_nchw, int N, int C, int H, int W,
 
     // 2) Execute regions (Phase 1 likely just one)
     for (const auto& r : regions_) {
+        const bool can_fuse = (vec == 16) &&
+                                region_is_two_conv_chain_3x3_s1_p1_relu_only(r.ir);
+        if (can_fuse) {
+            // Output dims for this region
+            const int outC_now = (int)r.ir.outC;
+            const int outH_now = (int)r.ir.outH;
+            const int outW_now = (int)r.ir.outW;
+
+            run_fused_two_conv_chain_avx512(
+                r.ir, r.weights,
+                cur, curC, curH, curW,
+                next, vec, nt);
+
+            // Swap and advance shape trackers
+            std::swap(cur, next);
+            curC = outC_now; curH = outH_now; curW = outW_now;
+            continue;  // fused handled the whole region
+        }
+
         // Walk ops in order; materialize after each Conv; apply Act in-place
         size_t conv_idx = 0; // index into packed weights/meta arrays
 

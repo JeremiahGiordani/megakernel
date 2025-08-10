@@ -31,7 +31,7 @@ add_library(mkcpu STATIC
   src/regionizer.cpp
   src/weight_packing.cpp
   src/conv_microkernels_avx512.cpp
-#   src/fused_conv_chain.cpp
+  src/fused_conv_chain.cpp
   src/engine.cpp
 )
 
@@ -41,10 +41,10 @@ target_compile_options(mkcpu PRIVATE ${MK_AVX512_FLAGS} -O3 -DNDEBUG -fvisibilit
 target_compile_definitions(mkcpu PUBLIC MK_AVX512=1 MK_VEC=16)
 
 # (Optional) OpenMP later:
-# find_package(OpenMP)
-# if (OpenMP_CXX_FOUND)
-#   target_link_libraries(mkcpu PUBLIC OpenMP::OpenMP_CXX)
-# endif()
+find_package(OpenMP)
+if (OpenMP_CXX_FOUND)
+  target_link_libraries(mkcpu PUBLIC OpenMP::OpenMP_CXX)
+endif()
 
 # Protobuf/ONNX linkage as you add them:
 find_package(Protobuf REQUIRED)
