@@ -267,11 +267,27 @@ void MegakernelModel::run(const float* input_nchw, int N, int C, int H, int W,
             const int outW_now = (int)conv_out_dim(curW, c.padW, /*dilation*/1, c.kW, c.strideW);
 
             // Run reference conv
+            const bool can_use_avx512_3x3_s1 =
+                (vec == 16) &&
+                (c.kH == 3 && c.kW == 3) &&
+                (c.strideH == 1 && c.strideW == 1) &&
+                (c.dilationH == 1 && c.dilationW == 1) &&
+                (c.padH == 1 && c.padW == 1);
+
+            if (can_use_avx512_3x3_s1) {
+            conv3x3_s1_nchwc_oihw16i16o_avx512(
+                cur, curC, curH, curW,
+                next, outC_now,
+                meta, Wp,
+                c.padH, c.padW, vec);
+            } else {
+            // Fallback reference (slow but correct)
             conv_ref_packed_nchwc(cur, curC, curH, curW,
-                                next, outC_now,
-                                meta, Wp,
-                                c.strideH, c.strideW, c.padH, c.padW,
-                                vec);
+                                    next, outC_now,
+                                    meta, Wp,
+                                    c.strideH, c.strideW, c.padH, c.padW,
+                                    vec);
+            }
 
             // Bias (if any)
             if (r.weights.bias_ptrs[conv_idx]) {

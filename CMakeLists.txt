@@ -30,7 +30,7 @@ add_library(mkcpu STATIC
   src/onnx_loader.cpp
   src/regionizer.cpp
   src/weight_packing.cpp
-#   src/conv_microkernels_avx512.cpp
+  src/conv_microkernels_avx512.cpp
 #   src/fused_conv_chain.cpp
   src/engine.cpp
 )
