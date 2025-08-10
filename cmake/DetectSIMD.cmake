@@ -1,0 +1,35 @@
+include(CheckCXXCompilerFlag)
+
+# Probe support
+check_cxx_compiler_flag("-mavx512f"   MK_COMPILER_HAS_AVX512F)
+check_cxx_compiler_flag("-mavx512bw"  MK_COMPILER_HAS_AVX512BW)
+check_cxx_compiler_flag("-mavx512dq"  MK_COMPILER_HAS_AVX512DQ)
+check_cxx_compiler_flag("-mavx512vl"  MK_COMPILER_HAS_AVX512VL)
+check_cxx_compiler_flag("-mfma"       MK_COMPILER_HAS_FMA)
+
+if (MSVC)
+  set(MK_HAS_AVX512 TRUE)
+  set(MK_AVX512_FLAGS "/arch:AVX512")
+else()
+  if (NOT MK_COMPILER_HAS_AVX512F)
+    message(FATAL_ERROR "Your compiler doesn't support -mavx512f; AVX-512 required.")
+  endif()
+
+  # Build a list of flags
+  set(MK_AVX512_FLAGS)
+  list(APPEND MK_AVX512_FLAGS "-mavx512f")
+  if (MK_COMPILER_HAS_AVX512BW)
+    list(APPEND MK_AVX512_FLAGS "-mavx512bw")
+  endif()
+  if (MK_COMPILER_HAS_AVX512DQ)
+    list(APPEND MK_AVX512_FLAGS "-mavx512dq")
+  endif()
+  if (MK_COMPILER_HAS_AVX512VL)
+    list(APPEND MK_AVX512_FLAGS "-mavx512vl")
+  endif()
+  if (MK_COMPILER_HAS_FMA)
+    list(APPEND MK_AVX512_FLAGS "-mfma")
+  endif()
+
+  set(MK_HAS_AVX512 TRUE)
+endif()
