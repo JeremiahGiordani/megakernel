@@ -10,11 +10,6 @@ if (NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-option(MKCPU_ENABLE_ASAN "Enable AddressSanitizer" ON)
-if (MKCPU_ENABLE_ASAN)
-  add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g)
-  add_link_options(-fsanitize=address)
-endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 include(DetectSIMD)

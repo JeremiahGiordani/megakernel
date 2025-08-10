@@ -73,7 +73,7 @@ void conv3x3_s1_nchwc_oihw16i16o_avx512(
                                 const float x = in_pix[ic_i];                  // scalar
                                 if (x == 0.0f) continue;                       // tiny speedup on zeros
                                 const long long Wrow = Wbase + (long long)ic_i * meta.stride_ic_i;
-                                const __m512 w = _mm512_loadu_ps(Wp + Wrow);    // 16 oc lanes
+                                const __m512 w = _mm512_load_ps(Wp + Wrow);   // 16 oc lanes
                                 const __m512 b = _mm512_set1_ps(x);
                                 acc = _mm512_fmadd_ps(b, w, acc);
                             }
@@ -82,11 +82,8 @@ void conv3x3_s1_nchwc_oihw16i16o_avx512(
                 }
 
                 // Store with mask for tail block
-                if (tail_block) {
-                    _mm512_mask_storeu_ps(out_pix, store_mask, acc);
-                } else {
-                    _mm512_storeu_ps(out_pix, acc);
-                }
+                if (tail_block) _mm512_mask_storeu_ps(out_pix, store_mask, acc);
+                else            _mm512_store_ps(out_pix, acc);
             } // ow
         }   // oh
     }     // ocb

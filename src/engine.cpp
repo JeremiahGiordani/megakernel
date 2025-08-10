@@ -5,7 +5,9 @@
 #include "epilogue.hpp"
 #include "conv_microkernels.hpp"
 #include "fused_conv_chain.hpp"
+#include "aligned_alloc.hpp"
 #include <omp.h>
+#include <iostream>
 
 #include <algorithm>
 #include <cassert>
@@ -254,12 +256,13 @@ void MegakernelModel::run(const float* input_nchw, int N, int C, int H, int W,
 
     // Allocate NCHWc scratch using the maximums
     const int Cb_max = (int)ceil_div((int64_t)maxC, (int64_t)vec);
-    const size_t scratch_elems = (size_t)Cb_max * (size_t)maxH * (size_t)maxW * (size_t)vec;
-    std::unique_ptr<float[]> bufA(new float[scratch_elems]);
-    std::unique_ptr<float[]> bufB(new float[scratch_elems]);
+    const size_t scratch_elems = (size_t)Cb_max * maxH * maxW * vec;
+    float* bufA = (float*)mk::aligned_alloc64(scratch_elems * sizeof(float));
+    float* bufB = (float*)mk::aligned_alloc64(scratch_elems * sizeof(float));
 
-    float* cur  = bufA.get();
-    float* next = bufB.get();
+    struct FreeBuf { ~FreeBuf(){ mk::aligned_free64(a); mk::aligned_free64(b);} float* a; float* b; } fb{bufA, bufB};
+    float* cur  = bufA;
+    float* next = bufB;
 
     // 1) Convert NCHW -> NCHWc
     nchw_to_nchwc(input_nchw, C, H, W, vec, cur);
