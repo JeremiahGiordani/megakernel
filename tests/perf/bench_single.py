@@ -6,7 +6,7 @@ os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 import jax
 import jax.numpy as jnp
 
-from attn_cpu import gemm, gemm_jit
+from mk_cpu import gemm
 
 # ----------------------------------------------------------------------
 # Experiment parameters
@@ -33,7 +33,6 @@ A_j, B_j = jnp.asarray(A), jnp.asarray(B)
 def torch_run(): return torch.matmul(A_t, B_t)
 def numpy_run(): return A @ B
 def cpu_run():   return gemm(A, B)
-def cpu_jit_run(): return gemm_jit(A, B)
 
 def jax_eager_run(): return A_j @ B_j
 
@@ -48,7 +47,6 @@ fns = {
     "torch":    ("[PyTorch]", torch_run),
     "numpy":    ("[NumPy]", numpy_run),
     "cpu":      ("[GEMM]", cpu_run),
-    "cpu_jit":  ("[GEMM JIT]", cpu_jit_run),
     "jax":      ("[JAX eager]", jax_eager_run),
     "jax_jit":  ("[JAX jit]", jax_jit_run),
 }

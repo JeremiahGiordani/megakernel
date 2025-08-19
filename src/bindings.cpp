@@ -4,7 +4,6 @@
 #include "gemm.h"
 
 namespace py = pybind11;
-using namespace mk;
 
 py::array_t<float> gemm_py(
     py::array_t<float, py::array::c_style | py::array::forcecast> A,
@@ -33,7 +32,7 @@ py::array_t<float> gemm_py(
     return C;
 }
 
-PYBIND11_MODULE(_attn_cpu, m) {
+PYBIND11_MODULE(_mk_cpu, m) {
     m.doc() = "CPU Megakernel implementations";
     m.def("gemm",
           &gemm_py,

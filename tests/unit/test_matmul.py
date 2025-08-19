@@ -2,7 +2,7 @@ import pytest
 import numpy as np
 import torch
 
-from attn_cpu import gemm  # your custom backend
+from mk_cpu import gemm
 
 # Shapes to test: square, rectangular, and irregular
 SHAPES = [

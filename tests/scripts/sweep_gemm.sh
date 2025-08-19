@@ -19,8 +19,8 @@ export BLIS_NUM_THREADS="${BLIS_NUM_THREADS:-1}"
 REPEAT="${REPEAT:-5}"                # << match Python 20 runs
 WARMUPS="${WARMUPS:-3}"               # << match Python
 
-# Your benchmark exe (produced as build/attn)
-CMD="${CMD:-./build/attn --bench gemm --m $M --n $N --k $K --repeats $REPEAT --warmups $WARMUPS --threads $THREADS}"
+# Your benchmark exe (produced as build/mk)
+CMD="${CMD:-./build/mk --bench gemm --m $M --n $N --k $K --repeats $REPEAT --warmups $WARMUPS --threads $THREADS}"
 
 MC_LIST=(${MC_LIST:-128 192 256 512 2048})
 KC_LIST=(${KC_LIST:-512 768 1024 1280})

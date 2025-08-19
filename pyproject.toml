@@ -15,4 +15,4 @@ wheel.packages = ["python/mk_cpu"]
 build-type = "Release"
 
 [tool.scikit-build.cmake.define]
-ATTN_BUILD_PYTHON = "ON"
+MK_BUILD_PYTHON = "ON"
