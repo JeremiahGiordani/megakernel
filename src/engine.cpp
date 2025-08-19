@@ -278,7 +278,7 @@ void MegakernelModel::run(const float* input_nchw, int N, int C, int H, int W,
             const int outH_now = (int)r.ir.outH;
             const int outW_now = (int)r.ir.outW;
 
-            run_fused_two_conv_chain_avx512(
+            run_fused_two_conv_chain_avx512_ringless(
                 r.ir, r.weights,
                 cur, curC, curH, curW,
                 next, vec, nt);

@@ -91,18 +91,19 @@ def main():
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         # Execution is SEQUENTIAL for fairness in single-thread scenarios
         so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        so.intra_op_num_threads  = args.threads
+        so.inter_op_num_threads  = args.threads
 
         providers = ["CPUExecutionProvider"]
-        provider_options = [{
-            "intra_op_num_threads": args.threads,
-            "inter_op_num_threads": 1,
-            # Depending on the wheel, these may be ignored; harmless.
-            "arena_extend_strategy": "kSameAsRequested",
-        }]
+        # provider_options = [{
+        #     "intra_op_num_threads": args.threads,
+        #     "inter_op_num_threads": 1,
+        #     # Depending on the wheel, these may be ignored; harmless.
+        #     "arena_extend_strategy": "kSameAsRequested",
+        # }]
 
         sess = ort.InferenceSession(onnx_path, sess_options=so,
-                                    providers=providers,
-                                    provider_options=provider_options)
+                                    providers=providers,)
 
         input_name = sess.get_inputs()[0].name
         def run_ort():

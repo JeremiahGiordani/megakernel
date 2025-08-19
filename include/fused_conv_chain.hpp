@@ -2,6 +2,15 @@
 #include "ir.hpp"
 #include "schedule.hpp"
 #include "weight_packing.hpp"
+#include "mk_compiler.hpp"
+
+#ifndef MK_OW_TILE
+#define MK_OW_TILE 8   // try 8, 12, 16 later
+#endif
+
+#ifndef MK_OCB_STEP
+#define MK_OCB_STEP 2  // process out-channel blocks in batches of 2 to manage registers
+#endif
 
 namespace mk {
 
@@ -18,5 +27,14 @@ void run_fused_two_conv_chain_avx512(
     const float* in_nchwc, int inC, int H, int Wspatial,
     float* out_nchwc, int vec = 16,
     int num_threads = 1);
+
+
+void run_fused_two_conv_chain_avx512_ringless(
+    const FusedRegion& ir,
+    const PackedWeights& Wp,
+    const float* MK_RESTRICT in_nchwc, int inC, int H, int W,
+    float* MK_RESTRICT out_nchwc, int vec,
+    int num_threads);
+
 
 } // namespace mk

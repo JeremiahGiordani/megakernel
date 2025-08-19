@@ -32,7 +32,14 @@ add_library(mkcpu STATIC
 
 target_include_directories(mkcpu PRIVATE third_party/onnx)
 target_include_directories(mkcpu PUBLIC include)
-target_compile_options(mkcpu PRIVATE ${MK_AVX512_FLAGS} -O3 -DNDEBUG -fvisibility=hidden)
+target_compile_options(mkcpu PRIVATE
+  ${MK_AVX512_FLAGS}
+  -Ofast
+  -DNDEBUG
+  -fvisibility=hidden
+  -ffast-math -fno-math-errno -fno-trapping-math
+  -funroll-loops
+)
 target_compile_definitions(mkcpu PUBLIC MK_AVX512=1 MK_VEC=16)
 
 # (Optional) OpenMP later:
