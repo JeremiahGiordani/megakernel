@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <omp.h>
+#include <iostream>
 
 namespace gemm {
 
@@ -374,6 +375,7 @@ void sgemm_blocked(const float* A, int M, int K,
   // Pick UNROLL once based on representative Kc
   int kc_test = std::min(KC, K);
   int uidx = pick_unroll_once_idx(kc_test);
+  // std::cout << "Unroll idx: " << uidx << std::endl;
   MicroOverwrite micro_overwrite = kOwTable[uidx];
   MicroAccum    micro_accum     = kAcTable[uidx];
 

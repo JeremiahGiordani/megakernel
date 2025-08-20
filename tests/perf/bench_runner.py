@@ -1,38 +1,37 @@
 #!/usr/bin/env python3
-import os, sys, subprocess
-
-backends = ["torch", "numpy", "cpu", "jax", "jax_jit"]
-backends = ["torch", "numpy", "cpu"]
+import os, sys, subprocess, shlex
 
 env = os.environ.copy()
-env["OMP_NUM_THREADS"] = "8"
-env["OMP_PROC_BIND"] = "close"
-env["OMP_PLACES"] = "cores"
-env["SGEMM_MC"] = "256"
-env["SGEMM_NC"] = "48"
-env["SGEMM_KC"] = "1280"
+# Thread placement (match your C++ runs)
+env.setdefault("OMP_NUM_THREADS", "8")
+env.setdefault("OPENBLAS_NUM_THREADS", "8")
+env.setdefault("MKL_NUM_THREADS", "8")
+env.setdefault("OMP_PROC_BIND", "close")
+env.setdefault("OMP_PLACES", "cores")
+env.setdefault("OMP_DYNAMIC", "FALSE")
 
+# Block sizes
+env.setdefault("SGEMM_MC", "64")
+env.setdefault("SGEMM_NC", "528")
+env.setdefault("SGEMM_KC", "512")
 
-print("=== Isolated Benchmarks ===")
 here = os.path.dirname(__file__)
 
-for backend in backends:
-    print(f"\n>>> Running {backend.upper()} benchmark...")
-    result = subprocess.run(
-        [sys.executable, os.path.join(here, "bench_single.py"), backend],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
+def run(cmd):
+    r = subprocess.run(cmd, text=True, capture_output=True, env=env)
+    if r.stdout.strip(): print(r.stdout.strip())
+    if r.returncode != 0 and r.stderr.strip():
+        print("stderr:", r.stderr.strip())
+    if r.returncode != 0:
+        print(f"exited with code {r.returncode}")
 
-    # Print stdout if present
-    if result.stdout.strip():
-        print(result.stdout.strip())
+print("=== Isolated Benchmarks ===")
+print("\n>>> Running TORCH benchmark...")
+run([sys.executable, os.path.join(here, "bench_single.py"), "torch", "--ref", "none"])
 
-    # Print stderr if present
-    if result.returncode != 0 and result.stderr.strip():
-        print("stderr:", result.stderr.strip())
+print("\n>>> Running NUMPY benchmark...")
+run([sys.executable, os.path.join(here, "bench_single.py"), "numpy", "--ref", "none"])
 
-    # If the process crashed (non-zero exit code), say so
-    if result.returncode != 0:
-        print(f"[{backend.upper()}] exited with code {result.returncode}")
+print("\n>>> Running CPU benchmark...")
+# IMPORTANT: do not pull PyTorch into this process; use numpy ref only
+run([sys.executable, os.path.join(here, "bench_single.py"), "cpu", "--ref", "numpy"])

@@ -7,5 +7,3 @@ from ._mk_cpu import (  # type: ignore
 
 def gemm(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     return _gemm(A, B)
-
-
