@@ -1,32 +1,38 @@
-// AVX-512 SGEMM tiler tuned to avoid tiny KC (too many K-panels).
+// Cache-driven tiler with candidate search + heuristic scoring.
+// Key idea: evaluate KC candidates; derive MC from L2, NC from L3; score by
+//  (1) minimizing K-panels (C traffic) and (2) minimizing A-pack count,
+//  with light tie-breaks (alignment, divisibility).
+
 #include "autotuner.h"
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
 
-#ifdef _OPENMP
-  #include <omp.h>
+#ifdef __linux__
+  #define GEMM_SYSFS 1
 #else
-  static inline int omp_get_max_threads(){ return 1; }
+  #define GEMM_SYSFS 0
 #endif
 
 namespace gemm {
 
-// Microkernel facts (your kernel)
+// Microkernel constants (your kernel)
 static constexpr int MR = 8;
 static constexpr int NR = 48;
-static constexpr int VL_FLOATS = 16; // AVX-512 (zmm) floats
+static constexpr int VL_FLOATS = 16; // AVX-512
 
 // ---------------- env helpers ----------------
 static inline const char* env_cstr(const char* name) {
   const char* s = std::getenv(name);
-  return s && *s ? s : nullptr;
+  return (s && *s) ? s : nullptr;
 }
 static inline int env_int_default(const char* name, int dflt) {
   if (const char* s = env_cstr(name)) return std::atoi(s);
@@ -34,27 +40,35 @@ static inline int env_int_default(const char* name, int dflt) {
 }
 static inline double env_float_default(const char* name, double dflt) {
   if (const char* s = env_cstr(name)) {
-    char* end=nullptr; double v = std::strtod(s,&end);
+    char* end=nullptr; double v=std::strtod(s,&end);
     if (end && end!=s) return v;
   }
   return dflt;
 }
-static inline long long parse_size_string_bytes(const std::string& s) {
-  std::string t; t.reserve(s.size());
-  for (char c: s) t.push_back(std::toupper(static_cast<unsigned char>(c)));
-  size_t i=0; while (i<t.size() && std::isspace((unsigned char)t[i])) ++i;
-  size_t j=t.size(); while (j>i && std::isspace((unsigned char)t[j-1])) --j;
-  if (i>=j) return 0;
-  t = t.substr(i, j-i);
-  long long mul=1;
-  if (!t.empty()) {
-    char last=t.back();
-    if (last=='K'){ mul=1024LL; t.pop_back(); }
-    else if (last=='M'){ mul=1024LL*1024LL; t.pop_back(); }
-    else if (last=='G'){ mul=1024LL*1024LL*1024LL; t.pop_back(); }
+static inline long long parse_size_string_bytes(std::string s) {
+  // parse "32K", "1M", "24.8M" (we accept decimal), "512M", "8G"
+  for (char& c: s) c = (char)std::toupper((unsigned char)c);
+  // trim
+  auto trim = [](std::string& t){
+    size_t i=0; while (i<t.size() && std::isspace((unsigned char)t[i])) ++i;
+    size_t j=t.size(); while (j>i && std::isspace((unsigned char)t[j-1])) --j;
+    t = (i<j)? t.substr(i,j-i): std::string();
+  };
+  trim(s);
+  if (s.empty()) return 0;
+  // suffix
+  double mul = 1.0;
+  char last = s.back();
+  if (last=='K' || last=='M' || last=='G'){
+    s.pop_back();
+    if (last=='K') mul = 1024.0;
+    else if (last=='M') mul = 1024.0*1024.0;
+    else mul = 1024.0*1024.0*1024.0;
   }
-  long long val=0; std::istringstream iss(t); iss>>val;
-  return iss.fail()? 0 : val*mul;
+  double val = 0.0;
+  try { val = std::stod(s); } catch (...) { return 0; }
+  long long out = (long long) std::llround(val * mul);
+  return (out>0)? out : 0;
 }
 static inline long long env_bytes_default(const char* name, long long dflt) {
   if (const char* s = env_cstr(name)) {
@@ -64,140 +78,164 @@ static inline long long env_bytes_default(const char* name, long long dflt) {
   return dflt;
 }
 
-// ---------------- cache detect (Linux best-effort) ----------------
+// ---------------- cache detect (Linux) ----------------
 struct CacheInfo {
-  long long l1d_bytes  = 32 * 1024;         // per-core default
-  long long l2_bytes   = 1LL * 1024 * 1024; // per-core default
-  long long l3_bytes   = 8LL * 1024 * 1024; // shared default
+  long long l1d_bytes  = 32 * 1024;         // per-core
+  long long l2_bytes   = 1LL * 1024 * 1024; // per-core
+  long long l3_bytes   = 8LL * 1024 * 1024; // shared
   int       line_bytes = 64;
 };
 
+#if GEMM_SYSFS
 static inline bool read_file(const std::string& path, std::string& out) {
   std::ifstream f(path);
   if (!f.good()) return false;
-  std::ostringstream ss; ss<<f.rdbuf(); out=ss.str();
-  return true;
+  std::ostringstream ss; ss<<f.rdbuf(); out=ss.str(); return true;
 }
 static inline long long parse_sysfs_size(const std::string& s) {
   return parse_size_string_bytes(s);
 }
 static bool detect_cache_linux(CacheInfo& ci) {
-#ifdef __linux__
   const char* base="/sys/devices/system/cpu/cpu0/cache";
   bool ok=false;
-  for (int idx=0; idx<8; ++idx){
+  for (int idx=0; idx<8; ++idx) {
     std::string p = std::string(base)+"/index"+std::to_string(idx)+"/";
-    std::string sLvl,sType,sSize,sLine;
-    if (!read_file(p+"level", sLvl)) continue;
-    if (!read_file(p+"type" , sType)) continue;
-    if (!read_file(p+"size" , sSize)) continue;
-    read_file(p+"coherency_line_size", sLine);
-    int lvl = std::atoi(sLvl.c_str());
-    for (auto& c: sType) c = (char)std::toupper((unsigned char)c);
-    long long sz = parse_sysfs_size(sSize);
-    if (lvl==1 && sType.find("DATA")!=std::string::npos) {
+    std::string lvlS, typeS, sizeS, lineS;
+    if (!read_file(p+"level", lvlS)) continue;
+    if (!read_file(p+"type" , typeS)) continue;
+    if (!read_file(p+"size" , sizeS)) continue;
+    read_file(p+"coherency_line_size", lineS);
+    int lvl = std::atoi(lvlS.c_str());
+    for (auto& c: typeS) c = (char)std::toupper((unsigned char)c);
+    long long sz = parse_sysfs_size(sizeS);
+    if (lvl==1 && typeS.find("DATA")!=std::string::npos) {
       if (sz>1024) ci.l1d_bytes = sz;
-      if (!sLine.empty()) ci.line_bytes = std::max(32, std::atoi(sLine.c_str()));
+      if (!lineS.empty()) ci.line_bytes = std::max(32, std::atoi(lineS.c_str()));
       ok=true;
     } else if (lvl==2) {
       if (sz>4096) ci.l2_bytes = sz;
-      if (!sLine.empty()) ci.line_bytes = std::max(32, std::atoi(sLine.c_str()));
+      if (!lineS.empty()) ci.line_bytes = std::max(32, std::atoi(lineS.c_str()));
       ok=true;
-    } else if (lvl==3 && sType.find("UNIFIED")!=std::string::npos) {
+    } else if (lvl==3 && typeS.find("UNIFIED")!=std::string::npos) {
       if (sz>4096) ci.l3_bytes = sz;
-      if (!sLine.empty()) ci.line_bytes = std::max(32, std::atoi(sLine.c_str()));
+      if (!lineS.empty()) ci.line_bytes = std::max(32, std::atoi(lineS.c_str()));
       ok=true;
     }
   }
   return ok;
-#else
-  (void)ci; return false;
+}
 #endif
-}
 
-// ---------------- helpers ----------------
-static inline int round_down_multiple(int x, int m){
-  if (m<=1) return x; return (x/m)*m;
-}
-static inline int round_up_multiple(int x, int m){
-  if (m<=1) return x; return ((x+m-1)/m)*m;
-}
-static inline int clampi(int v, int lo, int hi){
-  return std::max(lo, std::min(hi, v));
-}
+// ---------------- utilities ----------------
+static inline int round_down(int x, int m){ return (m<=1)? x : (x/m)*m; }
+static inline int round_up  (int x, int m){ return (m<=1)? x : ((x+m-1)/m)*m; }
+static inline int clampi(int v, int lo, int hi){ return std::max(lo, std::min(hi, v)); }
 
 // ---------------- main picker ----------------
 TileParams pick_tiles_avx512(int M, int N, int K, int dtype_bytes) {
-  // 0) Hard overrides (keep your original behavior)
-  const char* sMC = env_cstr("SGEMM_MC");
-  const char* sKC = env_cstr("SGEMM_KC");
-  const char* sNC = env_cstr("SGEMM_NC");
-  if (sMC || sKC || sNC){
-    TileParams t{
-      sMC ? std::max(MR, std::atoi(sMC)) : 256,
-      sKC ? std::max(1 , std::atoi(sKC)) : 512,
-      sNC ? clampi(std::max(NR, std::atoi(sNC)), NR, N) : N
-    };
-    t.MC = round_down_multiple(std::max(MR, t.MC), MR);
-    t.KC = std::max(1, t.KC);
-    t.NC = round_down_multiple(clampi(t.NC, NR, N), NR);
-    return t;
+  // 0) hard overrides
+  if (const char* s = env_cstr("SGEMM_MC"); s || env_cstr("SGEMM_KC") || env_cstr("SGEMM_NC")) {
+    int MC = s ? std::max(MR, std::atoi(s)) : 256;
+    int KC = env_int_default("SGEMM_KC", 512);
+    int NC = env_int_default("SGEMM_NC", N);
+    MC = round_down(std::max(MR, MC), MR);
+    KC = std::max(1, KC);
+    NC = round_down(clampi(NC, NR, N), NR);
+    return {MC, KC, NC};
   }
 
-  // 1) Detect caches (best-effort) and allow env overrides
+  // 1) caches
   CacheInfo ci;
-  detect_cache_linux(ci);
+#if GEMM_SYSFS
+  detect_cache_linux(ci); // best-effort
+#endif
   ci.l1d_bytes = env_bytes_default("SGEMM_L1D", ci.l1d_bytes);
   ci.l2_bytes  = env_bytes_default("SGEMM_L2" , ci.l2_bytes);
   ci.l3_bytes  = env_bytes_default("SGEMM_L3" , ci.l3_bytes);
 
-  // 2) Tunables
-  const int    K_PANELS = std::max(2, env_int_default("SGEMM_K_PANELS", 8)); // aim for ~8 K-panels
-  const int    KC_MIN   = std::max(2*VL_FLOATS, env_int_default("SGEMM_KC_MIN", 256)); // >=32, default 256
-  const int    KC_MAX   = env_int_default("SGEMM_KC_MAX", 1024);
-  const int    MC_MIN   = round_up_multiple(std::max(MR, env_int_default("SGEMM_MC_MIN", 64)), MR);
-  const double beta     = env_float_default("SGEMM_BETA" , 0.60); // A-pack fraction of L2
-  const double gamma    = env_float_default("SGEMM_GAMMA", 0.70); // B-panel fraction of LLC
-  const double eta      = env_float_default("SGEMM_LLC_EFF", 0.60); // reserve some LLC
+  // 2) knobs
+  const double beta   = env_float_default("SGEMM_BETA" , 0.60);
+  const double gamma  = env_float_default("SGEMM_GAMMA", 0.70);
+  const double eta    = env_float_default("SGEMM_LLC_EFF", 0.60);
 
-  // 3) Choose KC by "target number of K-panels" (avoid tiny KC)
-  int KC = round_down_multiple(std::max(1, (K + K_PANELS - 1) / K_PANELS), 2*VL_FLOATS); // multiple of 32
-  KC = clampi(KC, KC_MIN, std::min(KC_MAX, std::max(1, K)));
+  const int MC_MIN    = round_up(std::max(MR, env_int_default("SGEMM_MC_MIN", 64)), MR);
+  const int MC_CAP    = round_down(std::max(MC_MIN, env_int_default("SGEMM_MC_CAP", 256)), MR); // soft cap
+  const int KC_MIN    = round_up(std::max(64, env_int_default("SGEMM_KC_MIN", 256)), 64);
+  const int KC_MAX    = round_down(std::max(KC_MIN, env_int_default("SGEMM_KC_MAX", 2048)), 64);
 
-  // 4) Back-solve MC from L2 so A_pack fits beta * L2:
-  //    bytes(A_{MC×KC}) = MC*KC*dtype <= beta * L2  => MC_max = floor(beta*L2 / (b*KC))
-  long long l2_budget = (long long)(beta * (double)ci.l2_bytes);
-  long long mc_ll = (KC>0) ? (l2_budget / ( (long long)dtype_bytes * (long long)KC )) : MR;
-  int MC = (int)mc_ll;
-  MC = round_down_multiple(std::max(MC_MIN, MC), MR);
-  MC = clampi(MC, MR, std::max(MR, M));
+  // 3) candidate KC grid (64-step, prefer 256..2048; clamp by K)
+  std::vector<int> KCcands;
+  int KC_hi = std::min(KC_MAX, std::max(64, K));
+  for (int kc = KC_MIN; kc <= KC_hi; kc += 64) KCcands.push_back(kc);
 
-  // If MC collapsed because KC is too large, lower KC until MC >= MC_MIN.
-  while (MC < MC_MIN && KC > KC_MIN) {
-    // reduce KC by one AVX-512 "chunk" and recompute MC
-    KC = std::max(KC_MIN, KC - 2*VL_FLOATS);
-    mc_ll = (KC>0) ? (l2_budget / ((long long)dtype_bytes * (long long)KC)) : MR;
-    MC = round_down_multiple(std::max(MC_MIN, (int)mc_ll), MR);
+  // 4) scoring weights (heuristic; tweak via env if needed)
+  const double W_KPANELS    = env_float_default("SGEMM_W_KPANELS", 4.0); // fewer K panels is big win
+  const double W_APACKS     = env_float_default("SGEMM_W_APACKS" , 1.2); // fewer A packs preferred
+  const double W_KC_ALIGN   = env_float_default("SGEMM_W_KC_ALIGN", 0.15); // small bonus for kc%512==0
+
+  // 5) evaluate candidates
+  struct Choice { int KC, MC, NC; double score; };
+  Choice best{0,0,0,1e300};
+
+  const double L2_budget = beta * (double)ci.l2_bytes;
+  const double L3_budget = gamma * eta * (double)ci.l3_bytes;
+
+  for (int KC : KCcands) {
+    if (KC <= 0) continue;
+    // derive MC from L2: MC <= floor( L2_budget / (b*KC) )
+    long long mc_ll = (long long)(L2_budget / ( (double)dtype_bytes * (double)KC ));
+    int MC = (int)mc_ll;
+    MC = round_down(std::max(MC_MIN, MC), MR);
+    if (MC < MC_MIN) continue;           // too deep for L2 at this KC
+
+    // optional soft cap on MC to avoid giant L2 working sets / conflict risk
+    MC = std::min(MC, MC_CAP);
+
+    // derive NC from L3: KC*NC*b <= L3_budget
+    long long nc_ll = (long long)( L3_budget / ( (double)dtype_bytes * (double)KC ) );
+    int NC = (int)nc_ll;
+    NC = round_down(clampi(std::max(NR, NC), NR, N), NR);
+    if (NC < NR) continue;
+
+    // for very skinny N, pack all
+    if (N <= 2*NR) NC = N;
+
+    // compute K-panels and A-pack count
+    const int Kpanels  = (K + KC - 1) / KC;
+    const int Apacks   = ( (M + MC - 1) / MC ) * Kpanels;
+
+    // score: lower is better
+    double score = 0.0;
+    score += W_KPANELS * (double)Kpanels;
+    score += W_APACKS  * (double)Apacks;
+
+    // small alignment bonus if KC nicely divisible (e.g., 512)
+    if (KC % 512 == 0) score -= W_KC_ALIGN;
+
+    // keep the best
+    if (score < best.score) best = {KC, MC, NC, score};
   }
 
-  // 5) Choose NC from LLC (team-shared B panel). We don't divide by threads because the
-  //     B-panel is shared; the working set is roughly panel-sized at any moment.
-  //    bytes(B_{KC×NC}) <= gamma * eta * L3  => NC_max = floor(gamma*eta*L3 / (b*KC))
-  double llc_budget = gamma * eta * (double)ci.l3_bytes;
-  long long nc_ll = (KC>0) ? (long long)(llc_budget / ( (double)dtype_bytes * (double)KC)) : NR;
-  int NC = (int)nc_ll;
-  NC = round_down_multiple(std::max(NR, NC), NR);
-  NC = clampi(NC, NR, std::max(NR, N));
+  // Fallback if nothing passed (shouldn't happen): use conservative defaults
+  if (best.KC == 0) {
+    int KC = clampi(round_down(std::min(K, 512), 64), 64, K);
+    int MC = round_down(std::max(MC_MIN, (int)( (beta*ci.l2_bytes) / (double)(dtype_bytes*KC) )), MR);
+    MC = std::min(MC, MC_CAP);
+    int NC = round_down(clampi((int)( (gamma*eta*ci.l3_bytes) / (double)(dtype_bytes*KC)), NR, N), NR);
+    if (N <= 2*NR) NC = N;
+    best = {KC, std::max(MR,MC), std::max(NR,NC), 0.0};
+  }
 
-  // For very skinny-N, prefer packing all of N to avoid extra jc loops.
-  if (N <= 2*NR) NC = N;
-
-  // 6) Final clamps against problem shape
-  KC = clampi(KC, 1, std::max(1, K));
-  MC = clampi(MC, MR, std::max(MR, M));
-  NC = clampi(NC, NR, std::max(NR, N));
-
-  return TileParams{MC, KC, NC};
+  if (env_int_default("SGEMM_DEBUG", 0)) {
+    std::cerr << "[TILER] L1d=" << ci.l1d_bytes
+              << " L2=" << ci.l2_bytes
+              << " L3=" << ci.l3_bytes
+              << "  -> KC=" << best.KC
+              << " MC=" << best.MC
+              << " NC=" << best.NC
+              << " score=" << best.score << "\n";
+  }
+  return {best.MC, best.KC, best.NC};
 }
 
 } // namespace gemm
