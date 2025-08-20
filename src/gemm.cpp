@@ -1,11 +1,8 @@
 // sgemm_blocked.cpp — AVX-512 SGEMM with classic 3-level blocking (MC, KC, NC)
-// MR=16 variant to compare against MR=8 baseline.
-// Flow/features intentionally held steady: K-major packing, alpha-fused A pack,
-// UNROLL autotune, masked tails, pointer-bump, tuned prefetch, streaming stores.
-// Only microrow/NR geometry and microkernels change.
-//
-// Build: same as your current build. Export SGEMM_* env vars to tune.
-
+// Updated:
+//  - Parallel B-panel pack (no OpenMP tasks, no serialized single-thread pack)
+//  - NC defaults to N (pack whole N by default; override via SGEMM_NC)
+//  - Keeps templated UNROLL, masked tails, pointer-bump, tuned prefetch
 #include <immintrin.h>
 #include <algorithm>
 #include <cstdint>
@@ -18,9 +15,8 @@
 
 namespace gemm {
 
-// ---------------- geometry ----------------
-static constexpr int MR = 16;   // micro rows (changed from 8)
-static constexpr int NR = 16;   // micro cols (changed from 48; 1×zmm wide)
+static constexpr int MR = 8;    // micro rows
+static constexpr int NR = 48;   // micro cols (3× zmm)
 
 // ---------------- helpers ----------------
 static inline float* aligned_alloc64(size_t n_floats){
@@ -64,6 +60,7 @@ static inline void pack_A_tile_mrK(const float* __restrict A, int ldA,
   }
 }
 
+// Pack A block [ic:ic+mc) × [k0:k0+Kc)
 static inline void pack_A_block_mcxKc(const float* __restrict A, int ldA,
                                       int mc, int Kc, float alpha,
                                       float* __restrict Ap_blk){
@@ -85,8 +82,12 @@ static inline void pack_B_tile_Knr(const float* __restrict B, int ldB,
     const float* b_row = B + (size_t)k*ldB;
     float* dst = Bp + (size_t)k*NR;
     if(nr_eff==NR){
-      __m512 x=_mm512_loadu_ps(b_row + 0);
-      _mm512_store_ps(dst + 0, x); // packed buffer is 64B aligned
+      __m512 x0=_mm512_loadu_ps(b_row+ 0);
+      __m512 x1=_mm512_loadu_ps(b_row+16);
+      __m512 x2=_mm512_loadu_ps(b_row+32);
+      _mm512_store_ps(dst+ 0, x0);
+      _mm512_store_ps(dst+16, x1);
+      _mm512_store_ps(dst+32, x2);
     }else{
       int j=0; for(; j<nr_eff; ++j) dst[j]=b_row[j];
                for(; j<NR;     ++j) dst[j]=0.0f;
@@ -95,39 +96,44 @@ static inline void pack_B_tile_Knr(const float* __restrict B, int ldB,
 }
 
 // ---------------- masks ----------------
-static inline __mmask16 nr_mask16(int nr_eff){
-  int c = std::min(16, nr_eff);
-  return (c==16) ? (__mmask16)0xFFFF : (__mmask16)((1u<<c)-1u);
+static inline void nr_masks(int nr_eff, __mmask16 &m0, __mmask16 &m1, __mmask16 &m2){
+  int c0 = std::min(16, nr_eff);
+  int c1 = std::max(0, std::min(16, nr_eff - 16));
+  int c2 = std::max(0, std::min(16, nr_eff - 32));
+  m0 = (c0==16) ? 0xFFFF : ((__mmask16)((1u<<c0)-1u));
+  m1 = (c1==16) ? 0xFFFF : ((__mmask16)((1u<<c1)-1u));
+  m2 = (c2==16) ? 0xFFFF : ((__mmask16)((1u<<c2)-1u));
 }
 
 // ---------------- micro-kernels (templated UNROLL) ----------------
-// Overwrite: C = A*B (beta==0 path handled at top level)
 template<int UNROLL>
-static inline void micro_16x16_overwrite_u(const float* __restrict Ap,
-                                           const float* __restrict Bp,
-                                           float* __restrict C, int ldc, int Kc,
-                                           int mr_eff, int nr_eff, bool stream_last_panel)
+static inline void micro_8x48_overwrite_u(const float* __restrict Ap,
+                                          const float* __restrict Bp,
+                                          float* __restrict C, int ldc, int Kc,
+                                          int mr_eff, int nr_eff, bool stream_last_panel)
 {
   static_assert(UNROLL>=1 && UNROLL<=8, "UNROLL in [1,8]");
-
-  __m512 acc[MR];
+  __m512 acc0[MR], acc1[MR], acc2[MR];
 #pragma unroll
-  for(int r=0;r<MR;++r) acc[r]=_mm512_setzero_ps();
+  for(int r=0;r<MR;++r){ acc0[r]=_mm512_setzero_ps(); acc1[r]=_mm512_setzero_ps(); acc2[r]=_mm512_setzero_ps(); }
 
   const int PFD = pick_prefetch_distance(Kc);
   const float* a_ptr = Ap;
   const float* b_ptr = Bp;
 
+  int k=0, kend = Kc - (Kc % UNROLL);
   auto k_step = [&](const float* a, const float* b){
-    __m512 bv = _mm512_load_ps(b); // packed B is aligned
+    __m512 b0=_mm512_load_ps(b+ 0);
+    __m512 b1=_mm512_load_ps(b+16);
+    __m512 b2=_mm512_load_ps(b+32);
 #pragma unroll
     for(int r=0;r<MR;++r){
-      __m512 ar = _mm512_set1_ps(a[r]);
-      acc[r] = _mm512_fmadd_ps(ar, bv, acc[r]);
+      __m512 ar=_mm512_set1_ps(a[r]);
+      acc0[r]=_mm512_fmadd_ps(ar,b0,acc0[r]);
+      acc1[r]=_mm512_fmadd_ps(ar,b1,acc1[r]);
+      acc2[r]=_mm512_fmadd_ps(ar,b2,acc2[r]);
     }
   };
-
-  int k=0, kend = Kc - (Kc % UNROLL);
   for(; k<kend; k+=UNROLL){
     if(PFD>0){
       int kp=k+PFD; if(kp<Kc){
@@ -152,49 +158,60 @@ static inline void micro_16x16_overwrite_u(const float* __restrict Ap,
     for(int r=0;r<MR;++r){
       float* c = C + (size_t)r*ldc;
       if(stream_last_panel && aligned64(c)){
-        _mm512_stream_ps(c, acc[r]);
-      }else if(aligned64(c)){
-        _mm512_store_ps (c, acc[r]);
+        _mm512_stream_ps(c+ 0, acc0[r]);
+        _mm512_stream_ps(c+16, acc1[r]);
+        _mm512_stream_ps(c+32, acc2[r]);
       }else{
-        _mm512_storeu_ps(c, acc[r]);
+        if(aligned64(c)){
+          _mm512_store_ps (c+ 0, acc0[r]);
+          _mm512_store_ps (c+16, acc1[r]);
+          _mm512_store_ps (c+32, acc2[r]);
+        }else{
+          _mm512_storeu_ps(c+ 0, acc0[r]);
+          _mm512_storeu_ps(c+16, acc1[r]);
+          _mm512_storeu_ps(c+32, acc2[r]);
+        }
       }
     }
   }else{
-    __mmask16 m = nr_mask16(nr_eff);
+    __mmask16 m0,m1,m2; nr_masks(nr_eff,m0,m1,m2);
     for(int r=0;r<mr_eff;++r){
       float* c = C + (size_t)r*ldc;
-      _mm512_mask_storeu_ps(c, m, acc[r]);
+      _mm512_mask_storeu_ps(c+ 0, m0, acc0[r]);
+      _mm512_mask_storeu_ps(c+16, m1, acc1[r]);
+      _mm512_mask_storeu_ps(c+32, m2, acc2[r]);
     }
   }
 }
 
-// Accumulate: C += A*B  (for k0 > 0 panels)
 template<int UNROLL>
-static inline void micro_16x16_accum_u(const float* __restrict Ap,
-                                       const float* __restrict Bp,
-                                       float* __restrict C, int ldc, int Kc,
-                                       int mr_eff, int nr_eff)
+static inline void micro_8x48_accum_u(const float* __restrict Ap,
+                                      const float* __restrict Bp,
+                                      float* __restrict C, int ldc, int Kc,
+                                      int mr_eff, int nr_eff)
 {
   static_assert(UNROLL>=1 && UNROLL<=8, "UNROLL in [1,8]");
-
-  __m512 acc[MR];
+  __m512 acc0[MR], acc1[MR], acc2[MR];
 #pragma unroll
-  for(int r=0;r<MR;++r) acc[r]=_mm512_setzero_ps();
+  for(int r=0;r<MR;++r){ acc0[r]=_mm512_setzero_ps(); acc1[r]=_mm512_setzero_ps(); acc2[r]=_mm512_setzero_ps(); }
 
   const int PFD = pick_prefetch_distance(Kc);
   const float* a_ptr = Ap;
   const float* b_ptr = Bp;
 
+  int k=0, kend = Kc - (Kc % UNROLL);
   auto k_step = [&](const float* a, const float* b){
-    __m512 bv = _mm512_load_ps(b);
+    __m512 b0=_mm512_load_ps(b+ 0);
+    __m512 b1=_mm512_load_ps(b+16);
+    __m512 b2=_mm512_load_ps(b+32);
 #pragma unroll
     for(int r=0;r<MR;++r){
-      __m512 ar = _mm512_set1_ps(a[r]);
-      acc[r] = _mm512_fmadd_ps(ar, bv, acc[r]);
+      __m512 ar=_mm512_set1_ps(a[r]);
+      acc0[r]=_mm512_fmadd_ps(ar,b0,acc0[r]);
+      acc1[r]=_mm512_fmadd_ps(ar,b1,acc1[r]);
+      acc2[r]=_mm512_fmadd_ps(ar,b2,acc2[r]);
     }
   };
-
-  int k=0, kend = Kc - (Kc % UNROLL);
   for(; k<kend; k+=UNROLL){
     if(PFD>0){
       int kp=k+PFD; if(kp<Kc){
@@ -218,33 +235,48 @@ static inline void micro_16x16_accum_u(const float* __restrict Ap,
 #pragma unroll
     for(int r=0;r<MR;++r){
       float* c = C + (size_t)r*ldc;
-      __m512 cv = aligned64(c) ? _mm512_load_ps(c) : _mm512_loadu_ps(c);
-      cv = _mm512_add_ps(cv, acc[r]);
-      if(aligned64(c)) _mm512_store_ps (c, cv);
-      else             _mm512_storeu_ps(c, cv);
+      __m512 c0 = aligned64(c)? _mm512_load_ps (c+ 0) : _mm512_loadu_ps(c+ 0);
+      __m512 c1 = aligned64(c)? _mm512_load_ps (c+16) : _mm512_loadu_ps(c+16);
+      __m512 c2 = aligned64(c)? _mm512_load_ps (c+32) : _mm512_loadu_ps(c+32);
+      c0 = _mm512_add_ps(c0, acc0[r]);
+      c1 = _mm512_add_ps(c1, acc1[r]);
+      c2 = _mm512_add_ps(c2, acc2[r]);
+      if(aligned64(c)){
+        _mm512_store_ps (c+ 0, c0);
+        _mm512_store_ps (c+16, c1);
+        _mm512_store_ps (c+32, c2);
+      }else{
+        _mm512_storeu_ps(c+ 0, c0);
+        _mm512_storeu_ps(c+16, c1);
+        _mm512_storeu_ps(c+32, c2);
+      }
     }
   }else{
-    __mmask16 m = nr_mask16(nr_eff);
+    __mmask16 m0,m1,m2; nr_masks(nr_eff,m0,m1,m2);
     for(int r=0;r<mr_eff;++r){
       float* c = C + (size_t)r*ldc;
-      __m512 cv = _mm512_maskz_loadu_ps(m, c);
-      cv = _mm512_add_ps(cv, acc[r]);
-      _mm512_mask_storeu_ps(c, m, cv);
+      __m512 c0 = _mm512_maskz_loadu_ps(m0, c+ 0);
+      __m512 c1 = _mm512_maskz_loadu_ps(m1, c+16);
+      __m512 c2 = _mm512_maskz_loadu_ps(m2, c+32);
+      c0 = _mm512_add_ps(c0, acc0[r]);
+      c1 = _mm512_add_ps(c1, acc1[r]);
+      c2 = _mm512_add_ps(c2, acc2[r]);
+      _mm512_mask_storeu_ps(c+ 0, m0, c0);
+      _mm512_mask_storeu_ps(c+16, m1, c1);
+      _mm512_mask_storeu_ps(c+32, m2, c2);
     }
   }
 }
 
-// ---------------- dispatch tables + autotune ----------------
+// dispatch tables
 using MicroOverwrite = void(*)(const float*, const float*, float*, int, int, int, int, bool);
 using MicroAccum    = void(*)(const float*, const float*, float*, int, int, int, int);
-
 template<int U> static inline void micro_overwrite_entry(const float* a,const float* b,float* c,int ldc,int Kc,int mr,int nr,bool stream){
-  micro_16x16_overwrite_u<U>(a,b,c,ldc,Kc,mr,nr,stream);
+  micro_8x48_overwrite_u<U>(a,b,c,ldc,Kc,mr,nr,stream);
 }
 template<int U> static inline void micro_accum_entry(const float* a,const float* b,float* c,int ldc,int Kc,int mr,int nr){
-  micro_16x16_accum_u<U>(a,b,c,ldc,Kc,mr,nr);
+  micro_8x48_accum_u<U>(a,b,c,ldc,Kc,mr,nr);
 }
-
 static constexpr int kNumCand = 6;
 static constexpr int kCand[kNumCand] = {1,2,3,4,6,8};
 static MicroOverwrite kOwTable[kNumCand] = {
@@ -256,7 +288,7 @@ static MicroAccum kAcTable[kNumCand] = {
   micro_accum_entry<4>, micro_accum_entry<6>, micro_accum_entry<8>
 };
 
-// one-shot UNROLL picker (kept identical logic)
+// one-shot UNROLL picker (same safe buffer sizing/indexing)
 static std::atomic<int> g_unroll_idx{-1};
 static inline int pick_unroll_once_idx(int Kc_for_test){
   int tune   = env_int("SGEMM_TUNE", 1);
@@ -334,7 +366,7 @@ void sgemm_blocked(const float* A, int M, int K,
   // ---- Tunables (env) ----
   int MC = env_int("SGEMM_MC", 256);
   int KC = env_int("SGEMM_KC", 1024);
-  int NC = env_int("SGEMM_NC", N);
+  int NC = env_int("SGEMM_NC", N);   // default: pack whole N (matches your best results)
 
   MC = std::max(MR, MC);
   KC = std::max(1,  KC);
@@ -343,15 +375,17 @@ void sgemm_blocked(const float* A, int M, int K,
   // Pick UNROLL once based on representative Kc
   int kc_test = std::min(KC, K);
   int uidx = pick_unroll_once_idx(kc_test);
+  // std::cout << "Unroll idx: " << uidx << std::endl;
   MicroOverwrite micro_overwrite = kOwTable[uidx];
   MicroAccum    micro_accum     = kAcTable[uidx];
 
-  // Shared B-pack buffer (Kc × NCrounded)
+  // Shared B-pack buffers (two are fine though we use one per panel now)
   const int NC_round_cols = ((NC + NR - 1)/NR)*NR;
   float* Bp_buf = nullptr;
 
 #pragma omp parallel
   {
+    // Per-thread A pack buffer: max MC×KC floats
     float* Ap_thr = aligned_alloc64((size_t)MC * (size_t)KC);
 
 #pragma omp single
