@@ -153,6 +153,10 @@ TileParams pick_tiles_avx512(int M, int N, int K, int dtype_bytes) {
   ci.l2_bytes  = env_bytes_default("SGEMM_L2" , ci.l2_bytes);
   ci.l3_bytes  = env_bytes_default("SGEMM_L3" , ci.l3_bytes);
 
+  std::cout << "ci.l1d_bytes " << ci.l1d_bytes << std::endl;
+  std::cout << "ci.l2_bytes " << ci.l2_bytes << std::endl;
+  std::cout << "ci.l3_bytes " << ci.l3_bytes << std::endl;
+
   // 2) knobs
   const double beta   = env_float_default("SGEMM_BETA" , 0.60);
   const double gamma  = env_float_default("SGEMM_GAMMA", 0.70);
