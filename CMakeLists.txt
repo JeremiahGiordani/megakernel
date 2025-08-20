@@ -20,6 +20,7 @@ add_subdirectory(third_party/pybind11)
 # ---------------- Library ----------------
 add_library(mk STATIC
   src/gemm.cpp
+  src/autotuner.cpp
 )
 target_include_directories(mk PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(mk PRIVATE ${CMAKE_SOURCE_DIR}/third_party/xbyak)

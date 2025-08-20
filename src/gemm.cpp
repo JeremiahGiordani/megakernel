@@ -12,6 +12,7 @@
 #include <chrono>
 #include <omp.h>
 #include <iostream>
+#include "autotuner.h"
 
 namespace gemm {
 
@@ -364,9 +365,14 @@ void sgemm_blocked(const float* A, int M, int K,
   }
 
   // ---- Tunables (env) ----
-  int MC = env_int("SGEMM_MC", 256);
-  int KC = env_int("SGEMM_KC", 1024);
-  int NC = env_int("SGEMM_NC", N);   // default: pack whole N (matches your best results)
+  const auto tiles = gemm::pick_tiles_avx512(M, N, K, /*dtype_bytes=*/4);
+  int MC = tiles.MC;
+  int KC = tiles.KC;
+  int NC = tiles.NC;
+
+  std::cout << "MC: " << MC << std::endl;
+  std::cout << "KC: " << KC << std::endl;
+  std::cout << "NC: " << NC << std::endl;
 
   MC = std::max(MR, MC);
   KC = std::max(1,  KC);
