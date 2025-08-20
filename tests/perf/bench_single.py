@@ -9,8 +9,8 @@ os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")  # GCC OpenMP: sleep-yield
 # Your kernel settings (inherit from parent if already set)
 os.environ.setdefault("OMP_DYNAMIC", "FALSE")
 
-os.environ.setdefault("SGEMM_U", "3")
-os.environ.setdefault("SGEMM_TUNE", "0")
+# os.environ.setdefault("SGEMM_U", "3")
+# os.environ.setdefault("SGEMM_TUNE", "0")
 
 import numpy as np
 
