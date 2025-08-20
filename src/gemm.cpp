@@ -1,7 +1,8 @@
-// sgemm_blocked.cpp — AVX-512 SGEMM, 3-level blocking (MC,KC,NC)
-// Correctness fix: shared B-panel again (parallel pack), TN→TM compute kept.
-// Prefetch split (A→L1, B→L2), templated UNROLL, masked tails, stream-on-final.
-
+// sgemm_blocked.cpp — AVX-512 SGEMM with classic 3-level blocking (MC, KC, NC)
+// Updated:
+//  - Parallel B-panel pack (no OpenMP tasks, no serialized single-thread pack)
+//  - NC defaults to N (pack whole N by default; override via SGEMM_NC)
+//  - Keeps templated UNROLL, masked tails, pointer-bump, tuned prefetch
 #include <immintrin.h>
 #include <algorithm>
 #include <cstdint>
@@ -10,11 +11,12 @@
 #include <atomic>
 #include <chrono>
 #include <omp.h>
+#include <iostream>
 
 namespace gemm {
 
-static constexpr int MR = 8;
-static constexpr int NR = 48;
+static constexpr int MR = 8;    // micro rows
+static constexpr int NR = 48;   // micro cols (3× zmm)
 
 // ---------------- helpers ----------------
 static inline float* aligned_alloc64(size_t n_floats){
@@ -33,37 +35,32 @@ static inline void aligned_free64(float* p){
 }
 static inline bool aligned64(const void* p){ return ((reinterpret_cast<uintptr_t>(p)&63u)==0u); }
 static inline int  env_int (const char* name, int dflt){ const char* s=getenv(name); return s? std::atoi(s):dflt; }
+static inline bool env_bool(const char* name, bool dflt){ const char* s=getenv(name); return s? (std::atoi(s)!=0):dflt; }
 
-// Prefetch distances (can be overridden via env)
-static inline int pick_pfd_A(int Kc){
-  int pf = env_int("SGEMM_PFD_A", -1);
+static inline int pick_prefetch_distance(int K){
+  int pf = env_int("SGEMM_PFD", -1);
   if (pf >= 0) return pf;
-  if (Kc < 64) return 0;
-  int x = Kc >> 3; // ~Kc/8
-  return std::min(128, std::max(16, x));
-}
-static inline int pick_pfd_B(int Kc){
-  int pf = env_int("SGEMM_PFD_B", -1);
-  if (pf >= 0) return pf;
-  if (Kc < 64) return 0;
-  int x = Kc >> 3;
-  return std::min(128, std::max(16, x));
+  if (K < 64) return 0;
+  int x = K >> 3;
+  if (x < 16)  x = 16;
+  if (x > 128) x = 128;
+  return x;
 }
 
 // ---------------- packing ----------------
+// A: pack MR rows across Kc (k-major), fuse alpha
 static inline void pack_A_tile_mrK(const float* __restrict A, int ldA,
                                    int mr_eff, int Kc, float alpha,
                                    float* __restrict Ap){
   for(int k=0;k<Kc;++k){
     const float* a_col = A + k;
     float* dst = Ap + (size_t)k*MR;
-#pragma omp simd
-    for(int r=0;r<MR;++r){
-      float v = (r<mr_eff) ? a_col[(size_t)r*ldA] : 0.0f;
-      dst[r] = v * alpha;
-    }
+    int r=0; for(; r<mr_eff; ++r) dst[r] = a_col[(size_t)r*ldA]*alpha;
+            for(; r<MR;     ++r) dst[r] = 0.0f;
   }
 }
+
+// Pack A block [ic:ic+mc) × [k0:k0+Kc)
 static inline void pack_A_block_mcxKc(const float* __restrict A, int ldA,
                                       int mc, int Kc, float alpha,
                                       float* __restrict Ap_blk){
@@ -77,7 +74,7 @@ static inline void pack_A_block_mcxKc(const float* __restrict A, int ldA,
   }
 }
 
-// Pack one NR-tile (columns) of B across Kc into Bp
+// B: pack NR cols across Kc (k-major)
 static inline void pack_B_tile_Knr(const float* __restrict B, int ldB,
                                    int Kc, int nr_eff,
                                    float* __restrict Bp){
@@ -92,8 +89,8 @@ static inline void pack_B_tile_Knr(const float* __restrict B, int ldB,
       _mm512_store_ps(dst+16, x1);
       _mm512_store_ps(dst+32, x2);
     }else{
-#pragma omp simd
-      for(int j=0;j<NR;++j) dst[j] = (j<nr_eff)? b_row[j] : 0.0f;
+      int j=0; for(; j<nr_eff; ++j) dst[j]=b_row[j];
+               for(; j<NR;     ++j) dst[j]=0.0f;
     }
   }
 }
@@ -108,7 +105,7 @@ static inline void nr_masks(int nr_eff, __mmask16 &m0, __mmask16 &m1, __mmask16 
   m2 = (c2==16) ? 0xFFFF : ((__mmask16)((1u<<c2)-1u));
 }
 
-// ---------------- micro-kernels ----------------
+// ---------------- micro-kernels (templated UNROLL) ----------------
 template<int UNROLL>
 static inline void micro_8x48_overwrite_u(const float* __restrict Ap,
                                           const float* __restrict Bp,
@@ -120,8 +117,7 @@ static inline void micro_8x48_overwrite_u(const float* __restrict Ap,
 #pragma unroll
   for(int r=0;r<MR;++r){ acc0[r]=_mm512_setzero_ps(); acc1[r]=_mm512_setzero_ps(); acc2[r]=_mm512_setzero_ps(); }
 
-  const int PFA = pick_pfd_A(Kc);
-  const int PFB = pick_pfd_B(Kc);
+  const int PFD = pick_prefetch_distance(Kc);
   const float* a_ptr = Ap;
   const float* b_ptr = Bp;
 
@@ -139,11 +135,10 @@ static inline void micro_8x48_overwrite_u(const float* __restrict Ap,
     }
   };
   for(; k<kend; k+=UNROLL){
-    if(PFA>0 || PFB>0){
-      int kp=k+UNROLL+std::max(PFA,PFB);
-      if(kp<Kc){
-        if(PFA>0) _mm_prefetch((const char*)(Ap+(size_t)kp*MR), _MM_HINT_T0); // A→L1
-        if(PFB>0) _mm_prefetch((const char*)(Bp+(size_t)kp*NR), _MM_HINT_T1); // B→L2
+    if(PFD>0){
+      int kp=k+PFD; if(kp<Kc){
+        _mm_prefetch((const char*)(Ap+(size_t)kp*MR), _MM_HINT_T0);
+        _mm_prefetch((const char*)(Bp+(size_t)kp*NR), _MM_HINT_T0);
       }
     }
 #pragma unroll
@@ -200,8 +195,7 @@ static inline void micro_8x48_accum_u(const float* __restrict Ap,
 #pragma unroll
   for(int r=0;r<MR;++r){ acc0[r]=_mm512_setzero_ps(); acc1[r]=_mm512_setzero_ps(); acc2[r]=_mm512_setzero_ps(); }
 
-  const int PFA = pick_pfd_A(Kc);
-  const int PFB = pick_pfd_B(Kc);
+  const int PFD = pick_prefetch_distance(Kc);
   const float* a_ptr = Ap;
   const float* b_ptr = Bp;
 
@@ -219,11 +213,10 @@ static inline void micro_8x48_accum_u(const float* __restrict Ap,
     }
   };
   for(; k<kend; k+=UNROLL){
-    if(PFA>0 || PFB>0){
-      int kp=k+UNROLL+std::max(PFA,PFB);
-      if(kp<Kc){
-        if(PFA>0) _mm_prefetch((const char*)(Ap+(size_t)kp*MR), _MM_HINT_T0);
-        if(PFB>0) _mm_prefetch((const char*)(Bp+(size_t)kp*NR), _MM_HINT_T1);
+    if(PFD>0){
+      int kp=k+PFD; if(kp<Kc){
+        _mm_prefetch((const char*)(Ap+(size_t)kp*MR), _MM_HINT_T0);
+        _mm_prefetch((const char*)(Bp+(size_t)kp*NR), _MM_HINT_T0);
       }
     }
 #pragma unroll
@@ -295,7 +288,7 @@ static MicroAccum kAcTable[kNumCand] = {
   micro_accum_entry<4>, micro_accum_entry<6>, micro_accum_entry<8>
 };
 
-// one-shot UNROLL picker
+// one-shot UNROLL picker (same safe buffer sizing/indexing)
 static std::atomic<int> g_unroll_idx{-1};
 static inline int pick_unroll_once_idx(int Kc_for_test){
   int tune   = env_int("SGEMM_TUNE", 1);
@@ -339,7 +332,7 @@ static inline int pick_unroll_once_idx(int Kc_for_test){
   return best_i;
 }
 
-// ---------------- top-level SGEMM ----------------
+// ---------------- top-level SGEMM (3-level blocking) ----------------
 void sgemm_blocked(const float* A, int M, int K,
                    const float* B, int N,
                    float* C,
@@ -370,32 +363,35 @@ void sgemm_blocked(const float* A, int M, int K,
     return;
   }
 
-  // Tunables
+  // ---- Tunables (env) ----
   int MC = env_int("SGEMM_MC", 256);
-  int KC = env_int("SGEMM_KC", 768);
-  int NC_env = env_int("SGEMM_NC", -1);
-  int NC = (NC_env>0 ? NC_env : 528);   // 11×NR default (override via env)
+  int KC = env_int("SGEMM_KC", 1024);
+  int NC = env_int("SGEMM_NC", N);   // default: pack whole N (matches your best results)
 
   MC = std::max(MR, MC);
   KC = std::max(1,  KC);
   NC = std::max(NR, std::min(NC, N));
 
-  // UNROLL choice
+  // Pick UNROLL once based on representative Kc
   int kc_test = std::min(KC, K);
   int uidx = pick_unroll_once_idx(kc_test);
+  // std::cout << "Unroll idx: " << uidx << std::endl;
   MicroOverwrite micro_overwrite = kOwTable[uidx];
   MicroAccum    micro_accum     = kAcTable[uidx];
 
-  // Shared B buffer (max for this NC)
+  // Shared B-pack buffers (two are fine though we use one per panel now)
   const int NC_round_cols = ((NC + NR - 1)/NR)*NR;
   float* Bp_buf = nullptr;
 
 #pragma omp parallel
   {
+    // Per-thread A pack buffer: max MC×KC floats
     float* Ap_thr = aligned_alloc64((size_t)MC * (size_t)KC);
 
 #pragma omp single
-    { Bp_buf = aligned_alloc64((size_t)KC * (size_t)NC_round_cols); }
+    {
+      Bp_buf = aligned_alloc64((size_t)KC * (size_t)NC_round_cols);
+    }
 #pragma omp barrier
 
     for(int jc=0; jc<N; jc+=NC){
@@ -406,7 +402,7 @@ void sgemm_blocked(const float* A, int M, int K,
         const int Kc = std::min(KC, K - k0);
         const bool is_last_panel = (k0 + Kc >= K);
 
-        // ---- Parallel B pack into shared panel ----
+        // ---- Parallel B-pack for this (jc,k0) panel ----
 #pragma omp for schedule(static)
         for(int tn=0; tn<NT; ++tn){
           const int j0     = jc + tn*NR;
@@ -414,25 +410,25 @@ void sgemm_blocked(const float* A, int M, int K,
           const float* B_src = B + (size_t)k0*ldB + j0;
           float*       B_dst = Bp_buf + (size_t)tn*Kc*NR;
           pack_B_tile_Knr(B_src, ldB, Kc, nr_eff, B_dst);
-        } // implicit barrier at end of omp for
+        }
 
-        // ---- Compute: parallel over IC blocks; TN outer for reuse ----
-#pragma omp for schedule(static,1)
+        // ---- Compute over IC blocks (each thread packs A(ic,k0) once) ----
+#pragma omp for schedule(static)
         for(int ic=0; ic<M; ic+=MC){
           const int mc = std::min(MC, M - ic);
           const int MT = (mc + MR - 1)/MR;
 
           pack_A_block_mcxKc(A + (size_t)ic*ldA + k0, ldA, mc, Kc, alpha, Ap_thr);
 
-          for(int tn=0; tn<NT; ++tn){        // TN outer ⇒ keep B tile warm in L2
-            const int j0      = jc + tn*NR;
-            const int nr_eff  = std::min(NR, N - j0);
-            const float* Bp_t = Bp_buf + (size_t)tn*Kc*NR;
+          for(int tm=0; tm<MT; ++tm){
+            const int r_off   = ic + tm*MR;
+            const int mr_here = std::min(MR, M - r_off);
+            const float* Ap_t = Ap_thr + (size_t)tm*Kc*MR;
 
-            for(int tm=0; tm<MT; ++tm){
-              const int r_off   = ic + tm*MR;
-              const int mr_here = std::min(MR, M - r_off);
-              const float* Ap_t = Ap_thr + (size_t)tm*Kc*MR;
+            for(int tn=0; tn<NT; ++tn){
+              const int j0      = jc + tn*NR;
+              const int nr_eff  = std::min(NR, N - j0);
+              const float* Bp_t = Bp_buf + (size_t)tn*Kc*NR;
               float* C_tile     = C + (size_t)r_off*ldC + j0;
 
               if(k0==0){
@@ -444,12 +440,14 @@ void sgemm_blocked(const float* A, int M, int K,
             }
           }
         } // ic
-      }   // k0
-    }     // jc
+      } // k0
+    }   // jc
 
     aligned_free64(Ap_thr);
 #pragma omp single
-    { aligned_free64(Bp_buf); }
+    {
+      aligned_free64(Bp_buf);
+    }
   } // omp parallel
 }
 
