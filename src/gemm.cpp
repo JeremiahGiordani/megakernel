@@ -370,9 +370,9 @@ void sgemm_blocked(const float* A, int M, int K,
   int KC = tiles.KC;
   int NC = tiles.NC;
 
-  std::cout << "MC: " << MC << std::endl;
-  std::cout << "KC: " << KC << std::endl;
-  std::cout << "NC: " << NC << std::endl;
+  // std::cout << "MC: " << MC << std::endl;
+  // std::cout << "KC: " << KC << std::endl;
+  // std::cout << "NC: " << NC << std::endl;
 
   MC = std::max(MR, MC);
   KC = std::max(1,  KC);
