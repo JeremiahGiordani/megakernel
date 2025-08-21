@@ -128,7 +128,7 @@ static Caches detect_caches_linux(){
   return c;
 }
 
-// --------------------- persistent cache (versioned) ---------------------
+// --------------------- persistent caches (versioned) ---------------------
 struct CacheKey {
   size_t L2; size_t L3; int threads; int dtype; int mr; int nr; int ver;
   bool operator<(const CacheKey& o) const {
@@ -144,7 +144,7 @@ struct CacheKey {
 struct CacheVal { int MC; int KC; int NC; };
 
 static int cache_version() {
-  return env_int("SGEMM_CACHE_VERSION", 2); // bump to 2 so old entries are ignored
+  return env_int("SGEMM_CACHE_VERSION", 2);
 }
 static std::string default_cache_path() {
   if (const char* p = env_cstr("SGEMM_CACHE_FILE")) return std::string(p);
@@ -154,9 +154,37 @@ static std::string default_cache_path() {
   return dir + "/sgemm_tiles_v2.txt";
 }
 
+// --- FAST host+threads cache (skips detection entirely when present)
+struct HostKey {
+  std::string host; int threads; int dtype; int mr; int nr; int ver;
+  bool operator<(const HostKey& o) const {
+    if (host!=o.host) return host<o.host;
+    if (threads!=o.threads) return threads<o.threads;
+    if (dtype!=o.dtype) return dtype<o.dtype;
+    if (mr!=o.mr) return mr<o.mr;
+    if (nr!=o.nr) return nr<o.nr;
+    return ver<o.ver;
+  }
+};
+
+static std::string fast_cache_path() {
+  if (const char* p = env_cstr("SGEMM_FAST_CACHE_FILE")) return std::string(p);
+  const char* home = getenv("HOME");
+  std::string dir = home ? (std::string(home) + "/.cache") : std::string("/tmp");
+  ::mkdir(dir.c_str(), 0755);
+  return dir + "/sgemm_tiles_fast_v2.txt";
+}
+static std::string hostname_str() {
+  char buf[256]; buf[0]='\0';
+  if (gethostname(buf, sizeof(buf)-1)==0) { buf[sizeof(buf)-1]='\0'; return std::string(buf); }
+  return std::string("unknown-host");
+}
+
 static std::mutex g_cache_mu;
 static std::map<CacheKey, CacheVal> g_cache_mem;
 static bool g_cache_loaded=false;
+static std::map<HostKey, CacheVal> g_fast_mem;
+static bool g_fast_loaded=false;
 
 static void load_cache_file_locked(const std::string& path){
   if (g_cache_loaded) return;
@@ -178,6 +206,26 @@ static void save_cache_file_locked(const std::string& path){
   }
 }
 
+static void load_fast_file_locked(const std::string& path){
+  if (g_fast_loaded) return;
+  std::ifstream ifs(path); if(!ifs){ g_fast_loaded=true; return; }
+  HostKey k; CacheVal v;
+  while (ifs >> k.host >> k.threads >> k.dtype >> k.mr >> k.nr >> k.ver
+             >> v.MC >> v.KC >> v.NC) {
+    if (k.ver == cache_version()) g_fast_mem[k]=v;
+  }
+  g_fast_loaded=true;
+}
+static void save_fast_file_locked(const std::string& path){
+  std::ofstream ofs(path, std::ios::trunc);
+  for (const auto& kv : g_fast_mem) {
+    const auto& k=kv.first; const auto& v=kv.second;
+    ofs << k.host << " " << k.threads << " " << k.dtype << " "
+        << k.mr << " " << k.nr << " " << k.ver << " "
+        << v.MC << " " << v.KC << " " << v.NC << "\n";
+  }
+}
+
 // --------------------- tile picker ---------------------
 TileParams pick_tiles_avx512(int M, int N, int K, int dtype_bytes){
   // Hard overrides
@@ -189,11 +237,28 @@ TileParams pick_tiles_avx512(int M, int N, int K, int dtype_bytes){
     return t;
   }
 
-  const Caches c = detect_caches_linux();
   const int threads = std::max(1, env_int("OMP_NUM_THREADS", 1));
   const int ver = cache_version();
 
-  // Try cache
+  // ---------- FAST PATH: host+threads cache (no detection) ----------
+  if (!env_int("SGEMM_CACHE_DISABLE", 0)) {
+    std::lock_guard<std::mutex> lk(g_cache_mu);
+    load_fast_file_locked(fast_cache_path());
+    HostKey hk{hostname_str(), threads, dtype_bytes, MR, NR, ver};
+    auto it = g_fast_mem.find(hk);
+    if (it != g_fast_mem.end()) {
+      TileParams t{it->second.MC, it->second.KC, it->second.NC};
+      t.MC = clamp_int(round_down_multiple(std::max(MR,t.MC), MR), MR, std::max(MR,M));
+      t.KC = std::max(1, std::min(t.KC, K));
+      t.NC = clamp_int(round_down_multiple(std::max(NR,t.NC), NR), NR, std::max(NR,N));
+      return t;
+    }
+  }
+
+  // ---------- SLOW PATH: detect caches → read keyed cache → compute ----------
+  const Caches c = detect_caches_linux();
+
+  // Try full cache keyed by L2/L3
   if (!env_int("SGEMM_CACHE_DISABLE", 0)) {
     std::lock_guard<std::mutex> lk(g_cache_mu);
     load_cache_file_locked(default_cache_path());
@@ -204,58 +269,55 @@ TileParams pick_tiles_avx512(int M, int N, int K, int dtype_bytes){
       t.MC = clamp_int(round_down_multiple(std::max(MR,t.MC), MR), MR, std::max(MR,M));
       t.KC = std::max(1, std::min(t.KC, K));
       t.NC = clamp_int(round_down_multiple(std::max(NR,t.NC), NR), NR, std::max(NR,N));
+      // also populate fast cache for next time
+      HostKey hk{hostname_str(), threads, dtype_bytes, MR, NR, ver};
+      g_fast_mem[hk] = CacheVal{t.MC, t.KC, t.NC};
+      save_fast_file_locked(fast_cache_path());
       return t;
     }
   }
 
-  // Tunables (conservative & small-box friendly)
-  const double ALPHA = env_double("SGEMM_ALPHA", 0.75); // C in L2 guard
-  const double BETA  = env_double("SGEMM_BETA",  0.60); // L2 fraction
-  const double GAMMA = env_double("SGEMM_GAMMA", 0.50); // LLC fraction per thread
+  // ---- Heuristic (unchanged from last version) ----
+  const double ALPHA = env_double("SGEMM_ALPHA", 0.75);
+  const double BETA  = env_double("SGEMM_BETA",  0.60);
+  const double GAMMA = env_double("SGEMM_GAMMA", 0.50);
 
   const double L2_target = BETA * (double)c.L2_per_core;
   const double L3_per_thread = (double)c.L3_total / (double)threads;
 
-  // Candidate ladders (include 384; keep big KCs for large box)
   std::vector<int> kc_cands = {384, 512, 768, 1024, 1536, 2048, 3072};
   std::vector<int> nc_pref  = {336, 480, 528, 576, 672, 864, 1008, 1152, 1344};
   std::vector<int> mc_cands = {96, 64, 128};
 
   for(int& v : kc_cands){ if(v > K) v = K; }
   kc_cands.erase(std::remove_if(kc_cands.begin(), kc_cands.end(), [](int x){ return x<=0; }), kc_cands.end());
-
   auto ceil_div = [](int a, int b){ return (a + b - 1) / b; };
 
-  // Scoring
-  const double W_KPAN = 12.0;  // fewer K panels
-  const double W_NTIL = 4.0;   // fewer N tiles
-  const double W_MTIL = 2.0;   // fewer M tiles
-  const double W_L2   = 4.0;   // bias away from high L2 pressure
-  const double W_SMALLNC = 8.0; // discourage tiny NC when N is big
+  const double W_KPAN = 12.0;
+  const double W_NTIL = 4.0;
+  const double W_MTIL = 2.0;
+  const double W_L2   = 4.0;
+  const double W_SMALLNC = 8.0;
 
   double best_score = std::numeric_limits<double>::infinity();
   TileParams best {64, 512, std::min(N, 576)};
 
-  // ---- NEW: KC pre-filter using a *target NC* (prevents KC=2048 on small box)
-  const int NC_TARGET_MIN = env_int("SGEMM_NC_TARGET_MIN", 480); // 10×NR; 528 also fine
+  const int NC_TARGET_MIN = env_int("SGEMM_NC_TARGET_MIN", 480);
   std::vector<int> kc_pruned;
   kc_pruned.reserve(kc_cands.size());
   for (int KC : kc_cands) {
     double kc_nc_bytes = (double)KC * (double)NC_TARGET_MIN * (double)dtype_bytes;
     if (kc_nc_bytes <= GAMMA * L3_per_thread) kc_pruned.push_back(KC);
   }
-  if (kc_pruned.empty()) kc_pruned = kc_cands; // fallback if someone sets NC_TARGET_MIN too large
+  if (kc_pruned.empty()) kc_pruned = kc_cands;
 
   for(int KC : kc_pruned){
-    // LLC bound for NC based on KC
     double nc_max_f = (GAMMA * L3_per_thread) / ((double)KC * (double)dtype_bytes);
     int nc_llc = (int)std::floor(nc_max_f);
 
-    // If we can’t support even 336, this KC is too big for big-N shapes → skip
     const int MIN_NC_BIGN = (N >= 3*NR) ? 336 : NR;
     if (nc_llc < MIN_NC_BIGN) continue;
 
-    // Build NC list under the LLC cap
     std::vector<int> nc_cands;
     for(int nc : nc_pref){
       if(nc <= N && nc <= nc_llc) nc_cands.push_back(nc);
@@ -266,7 +328,6 @@ TileParams pick_tiles_avx512(int M, int N, int K, int dtype_bytes){
     }
 
     for(int NC : nc_cands){
-      // L2 guard → pick largest MC that fits
       int chosen_MC = 0;
       for(int MC : mc_cands){
         double bytes = (double)MC * ((double)KC + ALPHA*(double)NC) * (double)dtype_bytes;
@@ -284,7 +345,6 @@ TileParams pick_tiles_avx512(int M, int N, int K, int dtype_bytes){
 
       double score = W_KPAN*Pk + W_NTIL*Pj + W_MTIL*Pi + W_L2*l2_bias;
 
-      // Sweet-spot nudge; small-NC penalty on big-N shapes
       if(NC==528 || NC==576 || NC==1008 || NC==1152 || NC==1344) score *= 0.995;
       if (N >= 3*NR && NC < 480) score += W_SMALLNC;
       if(chosen_MC==64 || chosen_MC==96) score *= 0.997;
@@ -298,19 +358,22 @@ TileParams pick_tiles_avx512(int M, int N, int K, int dtype_bytes){
     }
   }
 
-  // Final sanitize & clamp
   best.MC = clamp_int(round_down_multiple(std::max(MR, best.MC), MR), MR, std::max(MR, M));
   best.KC = std::max(1, std::min(best.KC, K));
   best.NC = clamp_int(round_down_multiple(std::max(NR, best.NC), NR), NR, std::max(NR, N));
 
-  // Save to file cache
+  // Save to both caches for next time (so we’ll hit the fast path)
   if (!env_int("SGEMM_CACHE_DISABLE", 0)) {
     std::lock_guard<std::mutex> lk(g_cache_mu);
     load_cache_file_locked(default_cache_path());
     CacheKey key{c.L2_per_core, c.L3_total, threads, dtype_bytes, MR, NR, ver};
     g_cache_mem[key] = CacheVal{best.MC, best.KC, best.NC};
-    if (env_int("SGEMM_CACHE_CLEAR", 0)) { std::ofstream(default_cache_path(), std::ios::trunc).close(); }
     save_cache_file_locked(default_cache_path());
+
+    load_fast_file_locked(fast_cache_path());
+    HostKey hk{hostname_str(), threads, dtype_bytes, MR, NR, ver};
+    g_fast_mem[hk] = CacheVal{best.MC, best.KC, best.NC};
+    save_fast_file_locked(fast_cache_path());
   }
 
   return best;
