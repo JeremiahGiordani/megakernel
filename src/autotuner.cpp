@@ -5,40 +5,44 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fstream>
 #include <limits>
+#include <set>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
 
 namespace gemm {
 
-static constexpr int MR = 8;   // must match kernel
-static constexpr int NR = 48;  // must match kernel
+static constexpr int MR = 8;   // microkernel rows
+static constexpr int NR = 48;  // microkernel cols
 
-// ---------- helpers ----------
-static inline const char* env_cstr(const char* k){ const char* s=getenv(k); return (s && *s)? s: nullptr; }
+// --------------------- small utils ---------------------
+static inline const char* env_cstr(const char* k){ const char* s=getenv(k); return (s&&*s)? s:nullptr; }
 static inline int env_int(const char* k, int d){ if(const char* s=env_cstr(k)) return std::atoi(s); return d; }
 static inline double env_double(const char* k, double d){ if(const char* s=env_cstr(k)) return std::atof(s); return d; }
 
 static inline int round_down_multiple(int x, int m){ if(m<=0) return x; int r=x-(x%m); return std::max(m,r); }
 static inline int clamp_int(int v, int lo, int hi){ return std::max(lo, std::min(hi, v)); }
 
-static inline bool read_file(const std::string& p, std::string& out){
-  std::ifstream ifs(p); if(!ifs) return false; std::ostringstream ss; ss<<ifs.rdbuf(); out=ss.str(); return true;
+static inline bool read_text(const std::string& p, std::string& out){
+  std::ifstream ifs(p); if(!ifs) return false;
+  std::ostringstream ss; ss<<ifs.rdbuf(); out=ss.str(); return true;
 }
 static inline void trim(std::string& s){
   while(!s.empty() && std::isspace((unsigned char)s.front())) s.erase(s.begin());
   while(!s.empty() && std::isspace((unsigned char)s.back()))  s.pop_back();
 }
 static inline size_t parse_size_token(const std::string& s){
-  if(s.empty()) return 0;
-  size_t i=0; while(i<s.size() && (std::isdigit((unsigned char)s[i]) || s[i]=='.')) ++i;
+  std::string t=s; trim(t); if(t.empty()) return 0;
+  size_t i=0; while(i<t.size() && (std::isdigit((unsigned char)t[i]) || t[i]=='.')) ++i;
   if(i==0) return 0;
-  double v = std::atof(s.substr(0,i).c_str());
+  double v = std::atof(t.substr(0,i).c_str());
   double m = 1.0;
-  if(i<s.size()){
-    char c=s[i];
+  if(i<t.size()){
+    char c=t[i];
     if(c=='K'||c=='k') m=1024.0;
     else if(c=='M'||c=='m') m=1024.0*1024.0;
     else if(c=='G'||c=='g') m=1024.0*1024.0*1024.0;
@@ -46,37 +50,96 @@ static inline size_t parse_size_token(const std::string& s){
   double bytes=v*m; return bytes>0.0? (size_t)(bytes+0.5):0;
 }
 
-// Linux sysfs cache detection for cpu0
-struct Caches { size_t L1d=0, L2=0, L3=0; };
-static Caches detect_caches_linux() {
-  Caches c{};
-  // L1d (level 1, Data)
-  // L2 (level 2, Data/Unified)
-  // L3 (level 3, Unified)
-  for(int idx=0; idx<10; ++idx){
-    std::string base="/sys/devices/system/cpu/cpu0/cache/index"+std::to_string(idx)+"/";
-    std::string slev, styp, ssiz;
-    if(!read_file(base+"level", slev)) continue;
-    if(!read_file(base+"type",  styp)) continue;
-    if(!read_file(base+"size",  ssiz)) continue;
-    trim(slev); trim(styp); trim(ssiz);
-    int level = std::atoi(slev.c_str());
-    size_t bytes = parse_size_token(ssiz);
-    if(!bytes) continue;
-    if(level==1 && styp=="Data")         { c.L1d = bytes; }
-    else if(level==2 && (styp=="Data" || styp=="Unified")) { c.L2 = bytes; }
-    else if(level==3 && styp=="Unified") { c.L3 = bytes; }
+// --------------------- Linux cache detection ---------------------
+// We compute:
+//  - L2_per_core: from cpu0 L2 (indexX: level=2, type=Data/Unified)
+//  - L3_total:    sum over unique L3 instances in the system by deduping "shared_cpu_list"
+//                 (so multi-slice LLCs add up correctly)
+struct Caches { size_t L1d=0, L2_per_core=0, L3_total=0; };
+
+static std::vector<std::string> list_dir(const std::string& path){
+  std::vector<std::string> names;
+  DIR* d = opendir(path.c_str()); if(!d) return names;
+  dirent* ent;
+  while((ent=readdir(d))){
+    if(ent->d_name[0]=='.') continue;
+    names.emplace_back(ent->d_name);
   }
-  // Conservative fallbacks
-  if(!c.L1d) c.L1d = 32*1024;
-  if(!c.L2)  c.L2  = 1u*1024u*1024u;   // ~1 MiB per core typical
-  if(!c.L3)  c.L3  = 32u*1024u*1024u;  // ~32 MiB socket
+  closedir(d);
+  return names;
+}
+
+static Caches detect_caches_linux(){
+  Caches c{};
+  // L2 per-core from cpu0
+  {
+    std::string base="/sys/devices/system/cpu/cpu0/cache/";
+    for(const auto& idx : list_dir(base)){
+      std::string p = base + idx + "/";
+      std::string slev, styp, ssiz;
+      if(!read_text(p+"level", slev)) continue;
+      if(!read_text(p+"type",  styp)) continue;
+      if(!read_text(p+"size",  ssiz)) continue;
+      trim(slev); trim(styp); trim(ssiz);
+      int level = std::atoi(slev.c_str());
+      size_t bytes = parse_size_token(ssiz);
+      if(level==1 && styp=="Data") c.L1d = bytes;
+      if(level==2 && (styp=="Data" || styp=="Unified")) c.L2_per_core = bytes;
+    }
+    if(!c.L1d) c.L1d = 32*1024;
+    if(!c.L2_per_core) c.L2_per_core = 1u*1024u*1024u; // fallback
+  }
+
+  // L3 total by deduping shared_cpu_list across all cpu*/cache/index*
+  {
+    std::set<std::string> seen_groups;
+    size_t total = 0;
+    std::string cpuroot="/sys/devices/system/cpu/";
+    // enumerate cpuN
+    for(const auto& cpu : list_dir(cpuroot)){
+      if(cpu.rfind("cpu",0)!=0) continue; // skip non-cpu dirs
+      std::string cpath = cpuroot + cpu + "/cache/";
+      for(const auto& idx : list_dir(cpath)){
+        std::string base = cpath + idx + "/";
+        std::string slev, styp, ssiz, sgroup;
+        if(!read_text(base+"level", slev)) continue;
+        if(!read_text(base+"type",  styp)) continue;
+        if(!read_text(base+"size",  ssiz)) continue;
+        trim(slev); trim(styp); trim(ssiz);
+        int level = std::atoi(slev.c_str());
+        if(level!=3 || styp!="Unified") continue;
+        // group key
+        if(!read_text(base+"shared_cpu_list", sgroup)) continue;
+        trim(sgroup);
+        if(seen_groups.insert(sgroup).second){
+          size_t bytes = parse_size_token(ssiz);
+          total += bytes;
+        }
+      }
+    }
+    if(!total){
+      // last-resort fallback: try cpu0's L3 once
+      std::string base="/sys/devices/system/cpu/cpu0/cache/";
+      for(const auto& idx : list_dir(base)){
+        std::string p = base + idx + "/";
+        std::string slev, styp, ssiz;
+        if(!read_text(p+"level", slev)) continue;
+        if(!read_text(p+"type",  styp)) continue;
+        if(!read_text(p+"size",  ssiz)) continue;
+        trim(slev); trim(styp); trim(ssiz);
+        int level = std::atoi(slev.c_str());
+        if(level==3 && styp=="Unified"){ total = parse_size_token(ssiz); break; }
+      }
+    }
+    if(!total) total = 32u*1024u*1024u; // conservative default
+    c.L3_total = total;
+  }
   return c;
 }
 
-// ---------- the heuristic ----------
+// --------------------- Heuristic tuned to your data (8T) ---------------------
 TileParams pick_tiles_avx512(int M, int N, int K, int dtype_bytes){
-  // Hard overrides (same behavior you had)
+  // Hard overrides remain
   if(env_cstr("SGEMM_MC") || env_cstr("SGEMM_KC") || env_cstr("SGEMM_NC")){
     TileParams t{ env_int("SGEMM_MC",256), env_int("SGEMM_KC",512), env_int("SGEMM_NC",N) };
     t.MC = clamp_int(round_down_multiple(std::max(MR,t.MC), MR), MR, std::max(MR,M));
@@ -85,79 +148,84 @@ TileParams pick_tiles_avx512(int M, int N, int K, int dtype_bytes){
     return t;
   }
 
-  // Cache + threading info
-  Caches c = detect_caches_linux();
-  const int threads = env_int("OMP_NUM_THREADS", 1);
+  const Caches c = detect_caches_linux();
+  const int threads = std::max(1, env_int("OMP_NUM_THREADS", 1));
 
-  // Tunable constants (picked to match your two boxes at 8T)
-  const double ALPHA = env_double("SGEMM_ALPHA", 0.60);  // C write-alloc weight in L2 guard
-  const double BETA  = env_double("SGEMM_BETA",  0.75);  // fraction of L2 allowed for A + ALPHA*C
-  const double GAMMA = env_double("SGEMM_GAMMA", 0.40);  // fraction of per-thread LLC allowed for B panel
+  // Tunables (chosen to reproduce your winners; override with env if needed)
+  const double ALPHA = env_double("SGEMM_ALPHA", 0.75);   // weight C in L2 guard (write-alloc)
+  const double BETA  = env_double("SGEMM_BETA",  0.60);   // fraction of L2 budget for A + ALPHA*C
+  const double GAMMA = env_double("SGEMM_GAMMA", 0.50);   // fraction of per-thread LLC for KC*NC panel
 
-  const double L2_target = BETA * (double)c.L2;
-  const double L3_per_thread = (threads>0) ? ((double)c.L3 / (double)threads) : (double)c.L3;
+  const double L2_target = BETA * (double)c.L2_per_core;
+  const double L3_per_thread = (double)c.L3_total / (double)threads;
 
-  // KC candidates (clamped to K)
+  // Candidate ladders
   std::vector<int> kc_cands = {512, 768, 1024, 1536, 2048, 3072};
+  std::vector<int> nc_pref  = {336, 480, 528, 576, 672, 864, 1008, 1152, 1344};
+  std::vector<int> mc_cands = {96, 64, 128}; // prefer 96/64; allow 128 if roomy
+
+  // Clamp KC by K and drop zeros
   for(int& v : kc_cands){ if(v > K) v = K; }
   kc_cands.erase(std::remove_if(kc_cands.begin(), kc_cands.end(), [](int x){ return x<=0; }), kc_cands.end());
 
-  // Preferred NC values (multiples of NR)
-  std::vector<int> nc_pref = { 336, 480, 528, 576, 672, 1008, 1152, 1344 };
+  // Helper
+  auto ceil_div = [](int a, int b){ return (a + b - 1) / b; };
 
-  // MC candidates (largest first)
-  std::vector<int> mc_cands = {128, 96, 64};
-
-  // Scoring weights: light, just to break ties sensibly
-  const double W_KPAN = 8.0;  // fewer K panels (pack B less) is good
-  const double W_NTIL = 3.0;  // fewer N tiles is good
-  const double W_MTIL = 2.0;  // fewer M tiles is good
-  const double W_L2   = 2.0;  // small L2 pressure bias
+  // Scoring: bias to big KC (fewer K-panels), but enforce realistic NC and small MC
+  const double W_KPAN = 12.0;  // strongly prefer fewer K panels
+  const double W_NTIL = 4.0;   // fewer N tiles
+  const double W_MTIL = 2.0;   // fewer M tiles
+  const double W_L2   = 4.0;   // bias away from high L2 pressure
 
   double best_score = std::numeric_limits<double>::infinity();
   TileParams best {64, 512, std::min(N, 576)};
 
   for(int KC : kc_cands){
-    // LLC bound for NC (bytes: KC*NC*dtype <= GAMMA * L3_per_thread)
-    double max_nc_llc = (GAMMA * L3_per_thread) / ( (double)KC * (double)dtype_bytes );
-    int nc_llc = (int)std::floor(max_nc_llc);
+    // LLC bound for NC: KC*NC*dtype <= GAMMA * L3_per_thread
+    double nc_max_f = (GAMMA * L3_per_thread) / ((double)KC * (double)dtype_bytes);
+    int nc_llc = (int)std::floor(nc_max_f);
 
-    // Build NC candidate list for this KC
+    // Minimum NC we’ll consider for “big” N to avoid pathological small NC
+    int min_reasonable_nc = (N >= 3*NR) ? 336 : NR;
+    if(nc_llc < min_reasonable_nc) nc_llc = min_reasonable_nc; // floor up if detection underreports
+
+    // Build NC list for this KC
     std::vector<int> nc_cands;
     for(int nc : nc_pref){
       if(nc <= N && nc <= nc_llc) nc_cands.push_back(nc);
     }
-    // Ensure we have *something*: if none pass the LLC bound, take the largest NR-multiple that does.
     if(nc_cands.empty()){
       int nc = round_down_multiple(std::max(NR, std::min(N, nc_llc)), NR);
       if(nc >= NR) nc_cands.push_back(nc);
     }
 
     for(int NC : nc_cands){
-      // L2 guard: pick largest MC in {128,96,64} that satisfies
+      // L2 guard → pick largest MC in preferred order that satisfies:
       // (MC*(KC + ALPHA*NC))*dtype <= L2_target
-      int chosen_MC = MR;
+      int chosen_MC = 0;
       for(int MC : mc_cands){
         double bytes = (double)MC * ((double)KC + ALPHA*(double)NC) * (double)dtype_bytes;
         if(bytes <= L2_target){ chosen_MC = MC; break; }
       }
-      if(chosen_MC < 64) continue; // too much pressure; skip this KC/NC
+      if(chosen_MC == 0) continue;
 
       // Tile counts
-      auto ceil_div = [](int a, int b){ return (a + b - 1)/b; };
       int Pi = ceil_div(std::max(MR, M), std::max(MR, chosen_MC));
       int Pj = ceil_div(std::max(NR, N), std::max(NR, NC));
       int Pk = ceil_div(std::max(1,  K), std::max(1,  KC));
 
-      // Small bias against large MC near L2 limit (keeps MC in 64–96 region if similar)
+      // L2 pressure bias
       double A_bytes = (double)chosen_MC * (double)KC * (double)dtype_bytes;
       double C_bytes = (double)chosen_MC * (double)NC * (double)dtype_bytes;
-      double l2_bias = (A_bytes + 0.5*C_bytes) / std::max(1.0, (double)c.L2);
+      double l2_bias = (A_bytes + 0.5*C_bytes) / std::max(1.0, (double)c.L2_per_core);
 
+      // Score
       double score = W_KPAN*Pk + W_NTIL*Pj + W_MTIL*Pi + W_L2*l2_bias;
 
-      // Light tie-break to prefer "nice" NCs you liked (528/576/1008/1152)
-      if(NC==528 || NC==576 || NC==1008 || NC==1152) score *= 0.995;
+      // Tiny tie-breaks toward sweet-spot NCs you liked
+      if(NC==528 || NC==576 || NC==1008 || NC==1152 || NC==1344) score *= 0.995;
+      // Prefer MC=64/96 a hair if tied
+      if(chosen_MC==64 || chosen_MC==96) score *= 0.997;
 
       if(score < best_score){
         best_score = score;
@@ -168,7 +236,7 @@ TileParams pick_tiles_avx512(int M, int N, int K, int dtype_bytes){
     }
   }
 
-  // Final sanitize and clamp to problem size / MR/NR
+  // Final sanitize & clamp
   best.MC = clamp_int(round_down_multiple(std::max(MR, best.MC), MR), MR, std::max(MR, M));
   best.KC = std::max(1, std::min(best.KC, K));
   best.NC = clamp_int(round_down_multiple(std::max(NR, best.NC), NR), NR, std::max(NR, N));
