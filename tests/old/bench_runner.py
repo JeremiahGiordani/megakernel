@@ -1,38 +1,63 @@
 #!/usr/bin/env python3
-import os, sys, subprocess
+import os
+import sys
+import subprocess
+from datetime import datetime
+from pathlib import Path
 
-backends = ["torch", "numpy", "cpu", "jax", "jax_jit"]
-backends = ["torch", "numpy", "cpu"]
+# ===========================
+# Config — set these as needed
+# ===========================
+M        = 2048
+K        = 1280*4
+N        = 960
+RUNS     = 20
+WARMUPS  = 3
+SEED     = 42
+THREADS  = 8
 
-env = os.environ.copy()
-env["OMP_NUM_THREADS"] = "8"
-env["OMP_PROC_BIND"] = "close"
-env["OMP_PLACES"] = "cores"
-# env["SGEMM_MC"] = "256"
-# env["SGEMM_NC"] = "48"
-env["SGEMM_KC"] = "2048"
+# Optional kernel/env tuning
+SGEMM_KC = 1280            # set None to skip exporting
+PROC_BIND = "close"        # "close" | "spread" | None
+PLACES    = "cores"        # "cores" | "threads" | None
 
+# If you want NumPy med printed as well, set to "numpy".
+# Otherwise "cpu" is fine (bench_single still prints Torch + CPU medians).
+BACKEND  = "cpu"
 
-print("=== Isolated Benchmarks ===")
-here = os.path.dirname(__file__)
+# ===========================
+# Paths
+# ===========================
+HERE = Path(__file__).resolve().parent
+BENCH = HERE / "bench_single.py"
 
-for backend in backends:
-    print(f"\n>>> Running {backend.upper()} benchmark...")
-    result = subprocess.run(
-        [sys.executable, os.path.join(here, "bench_single.py"), backend],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
+def main():
+    env = os.environ.copy()
+    env["OMP_NUM_THREADS"] = str(THREADS)
+    if PROC_BIND: env["OMP_PROC_BIND"] = PROC_BIND
+    if PLACES:    env["OMP_PLACES"]    = PLACES
+    if SGEMM_KC is not None:
+        env["SGEMM_KC"] = str(SGEMM_KC)
 
-    # Print stdout if present
+    print(f"=== Single GEMM test @ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} ===")
+    print(f"Dims: M={M}, K={K}, N={N} | Threads={THREADS} | Runs={RUNS} | Warmups={WARMUPS}\n")
+
+    cmd = [
+        sys.executable, str(BENCH), BACKEND,
+        "--M", str(M), "--K", str(K), "--N", str(N),
+        "--runs", str(RUNS), "--warmups", str(WARMUPS),
+        "--seed", str(SEED),
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+
     if result.stdout.strip():
         print(result.stdout.strip())
 
-    # Print stderr if present
-    if result.returncode != 0 and result.stderr.strip():
-        print("stderr:", result.stderr.strip())
-
-    # If the process crashed (non-zero exit code), say so
     if result.returncode != 0:
-        print(f"[{backend.upper()}] exited with code {result.returncode}")
+        if result.stderr.strip():
+            print("stderr:", result.stderr.strip())
+        print(f"[{BACKEND.upper()}] exited with code {result.returncode}")
+
+if __name__ == "__main__":
+    main()
