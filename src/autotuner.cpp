@@ -23,6 +23,7 @@ namespace gemm {
 static constexpr int MR = 8;
 static constexpr int NR = 48;
 
+// --------------------- small utils ---------------------
 static inline const char* env_cstr(const char* k){ const char* s=getenv(k); return (s&&*s)? s:nullptr; }
 static inline int env_int(const char* k, int d){ if(const char* s=env_cstr(k)) return std::atoi(s); return d; }
 static inline double env_double(const char* k, double d){ if(const char* s=env_cstr(k)) return std::atof(s); return d; }
@@ -53,7 +54,7 @@ static inline size_t parse_size_token(const std::string& s){
   double bytes=v*m; return bytes>0.0? (size_t)(bytes+0.5):0;
 }
 
-// ----- cache detection -----
+// --------------------- Linux cache detection ---------------------
 struct Caches { size_t L1d=0, L2_per_core=0, L3_total=0; };
 
 static std::vector<std::string> list_dir(const std::string& path){
@@ -88,7 +89,7 @@ static Caches detect_caches_linux(){
     if(!c.L1d) c.L1d = 32*1024;
     if(!c.L2_per_core) c.L2_per_core = 1u*1024u*1024u;
   }
-  // L3 total by deduping shared_cpu_list
+  // L3 total by deduping shared_cpu_list across all cpus
   {
     std::set<std::string> seen;
     size_t total = 0;
@@ -127,25 +128,32 @@ static Caches detect_caches_linux(){
   return c;
 }
 
-// ----- persistent (file) cache -----
-struct CacheKey { size_t L2; size_t L3; int threads; int dtype; int mr; int nr;
+// --------------------- persistent cache (versioned) ---------------------
+struct CacheKey {
+  size_t L2; size_t L3; int threads; int dtype; int mr; int nr; int ver;
   bool operator<(const CacheKey& o) const {
     if (L2!=o.L2) return L2<o.L2;
     if (L3!=o.L3) return L3<o.L3;
     if (threads!=o.threads) return threads<o.threads;
     if (dtype!=o.dtype) return dtype<o.dtype;
     if (mr!=o.mr) return mr<o.mr;
-    return nr<o.nr;
-  } };
+    if (nr!=o.nr) return nr<o.nr;
+    return ver<o.ver;
+  }
+};
 struct CacheVal { int MC; int KC; int NC; };
 
+static int cache_version() {
+  return env_int("SGEMM_CACHE_VERSION", 2); // bump to 2 so old entries are ignored
+}
 static std::string default_cache_path() {
   if (const char* p = env_cstr("SGEMM_CACHE_FILE")) return std::string(p);
   const char* home = getenv("HOME");
   std::string dir = home ? (std::string(home) + "/.cache") : std::string("/tmp");
   ::mkdir(dir.c_str(), 0755);
-  return dir + "/sgemm_tiles_v1.txt";
+  return dir + "/sgemm_tiles_v2.txt";
 }
+
 static std::mutex g_cache_mu;
 static std::map<CacheKey, CacheVal> g_cache_mem;
 static bool g_cache_loaded=false;
@@ -154,8 +162,9 @@ static void load_cache_file_locked(const std::string& path){
   if (g_cache_loaded) return;
   std::ifstream ifs(path); if(!ifs){ g_cache_loaded=true; return; }
   CacheKey k; CacheVal v;
-  while (ifs >> k.L2 >> k.L3 >> k.threads >> k.dtype >> k.mr >> k.nr >> v.MC >> v.KC >> v.NC) {
-    g_cache_mem[k]=v;
+  while (ifs >> k.L2 >> k.L3 >> k.threads >> k.dtype >> k.mr >> k.nr >> k.ver
+             >> v.MC >> v.KC >> v.NC) {
+    if (k.ver == cache_version()) g_cache_mem[k]=v;
   }
   g_cache_loaded=true;
 }
@@ -164,12 +173,12 @@ static void save_cache_file_locked(const std::string& path){
   for (const auto& kv : g_cache_mem) {
     const auto& k=kv.first; const auto& v=kv.second;
     ofs << k.L2 << " " << k.L3 << " " << k.threads << " " << k.dtype << " "
-        << k.mr << " " << k.nr << " "
+        << k.mr << " " << k.nr << " " << k.ver << " "
         << v.MC << " " << v.KC << " " << v.NC << "\n";
   }
 }
 
-// ----- tile picker (updated) -----
+// --------------------- tile picker ---------------------
 TileParams pick_tiles_avx512(int M, int N, int K, int dtype_bytes){
   // Hard overrides
   if(env_cstr("SGEMM_MC") || env_cstr("SGEMM_KC") || env_cstr("SGEMM_NC")){
@@ -182,12 +191,13 @@ TileParams pick_tiles_avx512(int M, int N, int K, int dtype_bytes){
 
   const Caches c = detect_caches_linux();
   const int threads = std::max(1, env_int("OMP_NUM_THREADS", 1));
+  const int ver = cache_version();
 
-  // Try file cache
+  // Try cache
   if (!env_int("SGEMM_CACHE_DISABLE", 0)) {
     std::lock_guard<std::mutex> lk(g_cache_mu);
     load_cache_file_locked(default_cache_path());
-    CacheKey key{c.L2_per_core, c.L3_total, threads, dtype_bytes, MR, NR};
+    CacheKey key{c.L2_per_core, c.L3_total, threads, dtype_bytes, MR, NR, ver};
     auto it = g_cache_mem.find(key);
     if (it != g_cache_mem.end()) {
       TileParams t{it->second.MC, it->second.KC, it->second.NC};
@@ -198,45 +208,54 @@ TileParams pick_tiles_avx512(int M, int N, int K, int dtype_bytes){
     }
   }
 
-  // Tunables (slightly conservative)
-  const double ALPHA = env_double("SGEMM_ALPHA", 0.75);
-  const double BETA  = env_double("SGEMM_BETA",  0.60);
-  const double GAMMA = env_double("SGEMM_GAMMA", 0.50);
+  // Tunables (conservative & small-box friendly)
+  const double ALPHA = env_double("SGEMM_ALPHA", 0.75); // C in L2 guard
+  const double BETA  = env_double("SGEMM_BETA",  0.60); // L2 fraction
+  const double GAMMA = env_double("SGEMM_GAMMA", 0.50); // LLC fraction per thread
 
   const double L2_target = BETA * (double)c.L2_per_core;
   const double L3_per_thread = (double)c.L3_total / (double)threads;
 
-  // Candidate ladders (include 384 for the small box)
+  // Candidate ladders (include 384; keep big KCs for large box)
   std::vector<int> kc_cands = {384, 512, 768, 1024, 1536, 2048, 3072};
   std::vector<int> nc_pref  = {336, 480, 528, 576, 672, 864, 1008, 1152, 1344};
   std::vector<int> mc_cands = {96, 64, 128};
 
   for(int& v : kc_cands){ if(v > K) v = K; }
   kc_cands.erase(std::remove_if(kc_cands.begin(), kc_cands.end(), [](int x){ return x<=0; }), kc_cands.end());
+
   auto ceil_div = [](int a, int b){ return (a + b - 1) / b; };
 
-  const double W_KPAN = 12.0;
-  const double W_NTIL = 4.0;
-  const double W_MTIL = 2.0;
-  const double W_L2   = 4.0;
-  const double W_SMALLNC = 8.0;  // extra bias against very small NC on big-N problems
+  // Scoring
+  const double W_KPAN = 12.0;  // fewer K panels
+  const double W_NTIL = 4.0;   // fewer N tiles
+  const double W_MTIL = 2.0;   // fewer M tiles
+  const double W_L2   = 4.0;   // bias away from high L2 pressure
+  const double W_SMALLNC = 8.0; // discourage tiny NC when N is big
 
   double best_score = std::numeric_limits<double>::infinity();
   TileParams best {64, 512, std::min(N, 576)};
 
-  for(int KC : kc_cands){
-    // LLC bound for NC
+  // ---- NEW: KC pre-filter using a *target NC* (prevents KC=2048 on small box)
+  const int NC_TARGET_MIN = env_int("SGEMM_NC_TARGET_MIN", 480); // 10×NR; 528 also fine
+  std::vector<int> kc_pruned;
+  kc_pruned.reserve(kc_cands.size());
+  for (int KC : kc_cands) {
+    double kc_nc_bytes = (double)KC * (double)NC_TARGET_MIN * (double)dtype_bytes;
+    if (kc_nc_bytes <= GAMMA * L3_per_thread) kc_pruned.push_back(KC);
+  }
+  if (kc_pruned.empty()) kc_pruned = kc_cands; // fallback if someone sets NC_TARGET_MIN too large
+
+  for(int KC : kc_pruned){
+    // LLC bound for NC based on KC
     double nc_max_f = (GAMMA * L3_per_thread) / ((double)KC * (double)dtype_bytes);
     int nc_llc = (int)std::floor(nc_max_f);
 
-    // For large-N problems, we consider KC invalid if it cannot support at least 336 cols
-    const int min_nc_target = (N >= 3*NR) ? 336 : NR;
-    if (nc_llc < min_nc_target) {
-      // KC too large for this per-thread LLC → skip this KC (prevents KC=2048 with NC=336 on small box)
-      continue;
-    }
+    // If we can’t support even 336, this KC is too big for big-N shapes → skip
+    const int MIN_NC_BIGN = (N >= 3*NR) ? 336 : NR;
+    if (nc_llc < MIN_NC_BIGN) continue;
 
-    // Build NC candidates under the LLC cap
+    // Build NC list under the LLC cap
     std::vector<int> nc_cands;
     for(int nc : nc_pref){
       if(nc <= N && nc <= nc_llc) nc_cands.push_back(nc);
@@ -265,11 +284,9 @@ TileParams pick_tiles_avx512(int M, int N, int K, int dtype_bytes){
 
       double score = W_KPAN*Pk + W_NTIL*Pj + W_MTIL*Pi + W_L2*l2_bias;
 
-      // Prefer healthy NCs; penalize tiny NC on big-N shapes
+      // Sweet-spot nudge; small-NC penalty on big-N shapes
       if(NC==528 || NC==576 || NC==1008 || NC==1152 || NC==1344) score *= 0.995;
-      if (N >= 3*NR && NC < 480) score += W_SMALLNC; // pushes away from 336/432 unless forced
-
-      // Prefer MC=64/96 slightly
+      if (N >= 3*NR && NC < 480) score += W_SMALLNC;
       if(chosen_MC==64 || chosen_MC==96) score *= 0.997;
 
       if(score < best_score){
@@ -290,7 +307,7 @@ TileParams pick_tiles_avx512(int M, int N, int K, int dtype_bytes){
   if (!env_int("SGEMM_CACHE_DISABLE", 0)) {
     std::lock_guard<std::mutex> lk(g_cache_mu);
     load_cache_file_locked(default_cache_path());
-    CacheKey key{c.L2_per_core, c.L3_total, threads, dtype_bytes, MR, NR};
+    CacheKey key{c.L2_per_core, c.L3_total, threads, dtype_bytes, MR, NR, ver};
     g_cache_mem[key] = CacheVal{best.MC, best.KC, best.NC};
     if (env_int("SGEMM_CACHE_CLEAR", 0)) { std::ofstream(default_cache_path(), std::ios::trunc).close(); }
     save_cache_file_locked(default_cache_path());
