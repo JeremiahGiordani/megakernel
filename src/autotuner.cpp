@@ -17,6 +17,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <vector>
+#include <iostream>
 
 namespace gemm {
 
@@ -197,6 +198,10 @@ TileParams pick_tiles_avx512(int M, int N, int K, int dtype_bytes){
   }
 
   const Caches c = detect_caches_linux();
+
+  std::cout << "cache L1d" << c.L1d << std::endl;
+  std::cout << "cache L2_per_core" << c.L2_per_core << std::endl;
+  std::cout << "cache L3_total" << c.L3_total << std::endl;
   const int threads = std::max(1, env_int("OMP_NUM_THREADS", 1));
 
   // -- CACHE: try load
@@ -211,9 +216,11 @@ TileParams pick_tiles_avx512(int M, int N, int K, int dtype_bytes){
       t.MC = clamp_int(round_down_multiple(std::max(MR,t.MC), MR), MR, std::max(MR,M));
       t.KC = std::max(1, std::min(t.KC, K));
       t.NC = clamp_int(round_down_multiple(std::max(NR,t.NC), NR), NR, std::max(NR,N));
+      std::cout << "Using cache" << std::endl;
       return t;
     }
   }
+  std::cout << "NOT using cache" << std::endl;
 
   // Tunables (chosen to reproduce your winners; override with env if needed)
   const double ALPHA = env_double("SGEMM_ALPHA", 0.75);
