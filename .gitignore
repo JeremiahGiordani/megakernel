@@ -4,3 +4,6 @@ build/
 .vscode/
 *.so
 __pycache__/
+results/
+results_*.csv
+results_*.txt

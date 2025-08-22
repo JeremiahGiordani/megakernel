@@ -11,13 +11,24 @@ from pathlib import Path
 M        = 2048
 K        = 1280*4
 N        = 960
+
+
+M        = 64
+K        = 256
+N        = 64
+
+
+
+
 RUNS     = 20
 WARMUPS  = 3
 SEED     = 42
 THREADS  = 8
 
 # Optional kernel/env tuning
-SGEMM_KC = 1280            # set None to skip exporting
+SGEMM_KC = 512            # set None to skip exporting
+SGEMM_NC = 528
+SGEMM_MC = 64
 PROC_BIND = "close"        # "close" | "spread" | None
 PLACES    = "cores"        # "cores" | "threads" | None
 
@@ -36,8 +47,9 @@ def main():
     env["OMP_NUM_THREADS"] = str(THREADS)
     if PROC_BIND: env["OMP_PROC_BIND"] = PROC_BIND
     if PLACES:    env["OMP_PLACES"]    = PLACES
-    if SGEMM_KC is not None:
-        env["SGEMM_KC"] = str(SGEMM_KC)
+    env["SGEMM_KC"] = str(SGEMM_KC)
+    env["SGEMM_NC"] = str(SGEMM_NC)
+    env["SGEMM_MC"] = str(SGEMM_MC)
 
     print(f"=== Single GEMM test @ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} ===")
     print(f"Dims: M={M}, K={K}, N={N} | Threads={THREADS} | Runs={RUNS} | Warmups={WARMUPS}\n")
