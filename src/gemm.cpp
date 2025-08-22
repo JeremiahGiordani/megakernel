@@ -1,8 +1,5 @@
 // sgemm_blocked.cpp — AVX-512 SGEMM with classic 3-level blocking (MC, KC, NC)
-// Updated:
-//  - Parallel B-panel pack (no OpenMP tasks, no serialized single-thread pack)
-//  - NC defaults to N (pack whole N by default; override via SGEMM_NC)
-//  - Keeps templated UNROLL, masked tails, pointer-bump, tuned prefetch
+// Small-M fix v2: shared Ap_shr + correct sizing; small-M parallelism over (tn,tm)
 #include <immintrin.h>
 #include <algorithm>
 #include <cstdint>
@@ -36,7 +33,6 @@ static inline void aligned_free64(float* p){
 }
 static inline bool aligned64(const void* p){ return ((reinterpret_cast<uintptr_t>(p)&63u)==0u); }
 static inline int  env_int (const char* name, int dflt){ const char* s=getenv(name); return s? std::atoi(s):dflt; }
-static inline bool env_bool(const char* name, bool dflt){ const char* s=getenv(name); return s? (std::atoi(s)!=0):dflt; }
 
 static inline int pick_prefetch_distance(int K){
   int pf = env_int("SGEMM_PFD", -1);
@@ -107,6 +103,7 @@ static inline void nr_masks(int nr_eff, __mmask16 &m0, __mmask16 &m1, __mmask16 
 }
 
 // ---------------- micro-kernels (templated UNROLL) ----------------
+// (unchanged core; includes thin-path for mr_eff<MR)
 template<int UNROLL>
 static inline void micro_8x48_overwrite_u(const float* __restrict Ap,
                                           const float* __restrict Bp,
@@ -114,64 +111,84 @@ static inline void micro_8x48_overwrite_u(const float* __restrict Ap,
                                           int mr_eff, int nr_eff, bool stream_last_panel)
 {
   static_assert(UNROLL>=1 && UNROLL<=8, "UNROLL in [1,8]");
-  __m512 acc0[MR], acc1[MR], acc2[MR];
-#pragma unroll
-  for(int r=0;r<MR;++r){ acc0[r]=_mm512_setzero_ps(); acc1[r]=_mm512_setzero_ps(); acc2[r]=_mm512_setzero_ps(); }
-
   const int PFD = pick_prefetch_distance(Kc);
-  const float* a_ptr = Ap;
-  const float* b_ptr = Bp;
 
-  int k=0, kend = Kc - (Kc % UNROLL);
-  auto k_step = [&](const float* a, const float* b){
-    __m512 b0=_mm512_load_ps(b+ 0);
-    __m512 b1=_mm512_load_ps(b+16);
-    __m512 b2=_mm512_load_ps(b+32);
+  if (mr_eff == MR) {
+    __m512 acc0[MR], acc1[MR], acc2[MR];
 #pragma unroll
-    for(int r=0;r<MR;++r){
-      __m512 ar=_mm512_set1_ps(a[r]);
-      acc0[r]=_mm512_fmadd_ps(ar,b0,acc0[r]);
-      acc1[r]=_mm512_fmadd_ps(ar,b1,acc1[r]);
-      acc2[r]=_mm512_fmadd_ps(ar,b2,acc2[r]);
-    }
-  };
-  for(; k<kend; k+=UNROLL){
-    if(PFD>0){
-      int kp=k+PFD; if(kp<Kc){
+    for(int r=0;r<MR;++r){ acc0[r]=_mm512_setzero_ps(); acc1[r]=_mm512_setzero_ps(); acc2[r]=_mm512_setzero_ps(); }
+    const float* a_ptr = Ap; const float* b_ptr = Bp;
+    int k=0, kend = Kc - (Kc % UNROLL);
+    auto k_step = [&](const float* a, const float* b){
+      __m512 b0=_mm512_load_ps(b+ 0), b1=_mm512_load_ps(b+16), b2=_mm512_load_ps(b+32);
+#pragma unroll
+      for(int r=0;r<MR;++r){ __m512 ar=_mm512_set1_ps(a[r]);
+        acc0[r]=_mm512_fmadd_ps(ar,b0,acc0[r]);
+        acc1[r]=_mm512_fmadd_ps(ar,b1,acc1[r]);
+        acc2[r]=_mm512_fmadd_ps(ar,b2,acc2[r]); }
+    };
+    for(; k<kend; k+=UNROLL){
+      if(PFD>0){ int kp=k+PFD; if(kp<Kc){
         _mm_prefetch((const char*)(Ap+(size_t)kp*MR), _MM_HINT_T0);
-        _mm_prefetch((const char*)(Bp+(size_t)kp*NR), _MM_HINT_T0);
+        _mm_prefetch((const char*)(Bp+(size_t)kp*NR), _MM_HINT_T0); } }
+#pragma unroll
+      for(int u=0; u<UNROLL; ++u) k_step(a_ptr + (size_t)u*MR, b_ptr + (size_t)u*NR);
+      a_ptr += (size_t)UNROLL*MR; b_ptr += (size_t)UNROLL*NR;
+    }
+    for(; k<Kc; ++k){ k_step(a_ptr,b_ptr); a_ptr+=MR; b_ptr+=NR; }
+
+    if(nr_eff==NR){
+#pragma unroll
+      for(int r=0;r<MR;++r){
+        float* c = C + (size_t)r*ldc;
+        if(stream_last_panel && aligned64(c)){
+          _mm512_stream_ps(c+ 0, acc0[r]); _mm512_stream_ps(c+16, acc1[r]); _mm512_stream_ps(c+32, acc2[r]);
+        }else if(aligned64(c)){
+          _mm512_store_ps (c+ 0, acc0[r]); _mm512_store_ps (c+16, acc1[r]); _mm512_store_ps (c+32, acc2[r]);
+        }else{
+          _mm512_storeu_ps(c+ 0, acc0[r]); _mm512_storeu_ps(c+16, acc1[r]); _mm512_storeu_ps(c+32, acc2[r]);
+        }
+      }
+    }else{
+      __mmask16 m0,m1,m2; nr_masks(nr_eff,m0,m1,m2);
+      for(int r=0;r<MR;++r){
+        float* c = C + (size_t)r*ldc;
+        _mm512_mask_storeu_ps(c+ 0, m0, acc0[r]);
+        _mm512_mask_storeu_ps(c+16, m1, acc1[r]);
+        _mm512_mask_storeu_ps(c+32, m2, acc2[r]);
       }
     }
-#pragma unroll
-    for(int u=0; u<UNROLL; ++u){
-      k_step(a_ptr + (size_t)u*MR, b_ptr + (size_t)u*NR);
-    }
-    a_ptr += (size_t)UNROLL*MR;
-    b_ptr += (size_t)UNROLL*NR;
-  }
-  for(; k<Kc; ++k){
-    k_step(a_ptr, b_ptr);
-    a_ptr += MR; b_ptr += NR;
+    return;
   }
 
-  if(mr_eff==MR && nr_eff==NR){
-#pragma unroll
-    for(int r=0;r<MR;++r){
+  // Thin path (mr_eff < MR)
+  __m512 acc0[MR], acc1[MR], acc2[MR];
+  for(int r=0;r<mr_eff;++r){ acc0[r]=_mm512_setzero_ps(); acc1[r]=_mm512_setzero_ps(); acc2[r]=_mm512_setzero_ps(); }
+  const float* a_ptr = Ap; const float* b_ptr = Bp;
+  int k=0, kend = Kc - (Kc % UNROLL);
+  auto k_step_thin = [&](const float* a, const float* b){
+    __m512 b0=_mm512_load_ps(b+ 0), b1=_mm512_load_ps(b+16), b2=_mm512_load_ps(b+32);
+    for(int r=0;r<mr_eff;++r){ __m512 ar=_mm512_set1_ps(a[r]);
+      acc0[r]=_mm512_fmadd_ps(ar,b0,acc0[r]);
+      acc1[r]=_mm512_fmadd_ps(ar,b1,acc1[r]);
+      acc2[r]=_mm512_fmadd_ps(ar,b2,acc2[r]); }
+  };
+  for(; k<kend; k+=UNROLL){
+    if(pick_prefetch_distance(Kc)>0){ int kp=k+pick_prefetch_distance(Kc); if(kp<Kc){
+      _mm_prefetch((const char*)(Ap+(size_t)kp*MR), _MM_HINT_T0);
+      _mm_prefetch((const char*)(Bp+(size_t)kp*NR), _MM_HINT_T0); } }
+    for(int u=0; u<UNROLL; ++u) k_step_thin(a_ptr + (size_t)u*MR, b_ptr + (size_t)u*NR);
+    a_ptr += (size_t)UNROLL*MR; b_ptr += (size_t)UNROLL*NR;
+  }
+  for(; k<Kc; ++k){ k_step_thin(a_ptr,b_ptr); a_ptr+=MR; b_ptr+=NR; }
+
+  if(nr_eff==NR){
+    for(int r=0;r<mr_eff;++r){
       float* c = C + (size_t)r*ldc;
-      if(stream_last_panel && aligned64(c)){
-        _mm512_stream_ps(c+ 0, acc0[r]);
-        _mm512_stream_ps(c+16, acc1[r]);
-        _mm512_stream_ps(c+32, acc2[r]);
+      if(aligned64(c)){
+        _mm512_store_ps (c+ 0, acc0[r]); _mm512_store_ps (c+16, acc1[r]); _mm512_store_ps (c+32, acc2[r]);
       }else{
-        if(aligned64(c)){
-          _mm512_store_ps (c+ 0, acc0[r]);
-          _mm512_store_ps (c+16, acc1[r]);
-          _mm512_store_ps (c+32, acc2[r]);
-        }else{
-          _mm512_storeu_ps(c+ 0, acc0[r]);
-          _mm512_storeu_ps(c+16, acc1[r]);
-          _mm512_storeu_ps(c+32, acc2[r]);
-        }
+        _mm512_storeu_ps(c+ 0, acc0[r]); _mm512_storeu_ps(c+16, acc1[r]); _mm512_storeu_ps(c+32, acc2[r]);
       }
     }
   }else{
@@ -192,64 +209,94 @@ static inline void micro_8x48_accum_u(const float* __restrict Ap,
                                       int mr_eff, int nr_eff)
 {
   static_assert(UNROLL>=1 && UNROLL<=8, "UNROLL in [1,8]");
-  __m512 acc0[MR], acc1[MR], acc2[MR];
-#pragma unroll
-  for(int r=0;r<MR;++r){ acc0[r]=_mm512_setzero_ps(); acc1[r]=_mm512_setzero_ps(); acc2[r]=_mm512_setzero_ps(); }
-
   const int PFD = pick_prefetch_distance(Kc);
-  const float* a_ptr = Ap;
-  const float* b_ptr = Bp;
 
-  int k=0, kend = Kc - (Kc % UNROLL);
-  auto k_step = [&](const float* a, const float* b){
-    __m512 b0=_mm512_load_ps(b+ 0);
-    __m512 b1=_mm512_load_ps(b+16);
-    __m512 b2=_mm512_load_ps(b+32);
+  if (mr_eff == MR) {
+    __m512 acc0[MR], acc1[MR], acc2[MR];
 #pragma unroll
-    for(int r=0;r<MR;++r){
-      __m512 ar=_mm512_set1_ps(a[r]);
-      acc0[r]=_mm512_fmadd_ps(ar,b0,acc0[r]);
-      acc1[r]=_mm512_fmadd_ps(ar,b1,acc1[r]);
-      acc2[r]=_mm512_fmadd_ps(ar,b2,acc2[r]);
-    }
-  };
-  for(; k<kend; k+=UNROLL){
-    if(PFD>0){
-      int kp=k+PFD; if(kp<Kc){
+    for(int r=0;r<MR;++r){ acc0[r]=_mm512_setzero_ps(); acc1[r]=_mm512_setzero_ps(); acc2[r]=_mm512_setzero_ps(); }
+    const float* a_ptr = Ap; const float* b_ptr = Bp;
+    int k=0, kend = Kc - (Kc % UNROLL);
+    auto k_step = [&](const float* a, const float* b){
+      __m512 b0=_mm512_load_ps(b+ 0), b1=_mm512_load_ps(b+16), b2=_mm512_load_ps(b+32);
+#pragma unroll
+      for(int r=0;r<MR;++r){ __m512 ar=_mm512_set1_ps(a[r]);
+        acc0[r]=_mm512_fmadd_ps(ar,b0,acc0[r]);
+        acc1[r]=_mm512_fmadd_ps(ar,b1,acc1[r]);
+        acc2[r]=_mm512_fmadd_ps(ar,b2,acc2[r]); }
+    };
+    for(; k<kend; k+=UNROLL){
+      if(PFD>0){ int kp=k+PFD; if(kp<Kc){
         _mm_prefetch((const char*)(Ap+(size_t)kp*MR), _MM_HINT_T0);
-        _mm_prefetch((const char*)(Bp+(size_t)kp*NR), _MM_HINT_T0);
+        _mm_prefetch((const char*)(Bp+(size_t)kp*NR), _MM_HINT_T0); } }
+#pragma unroll
+      for(int u=0; u<UNROLL; ++u) k_step(a_ptr + (size_t)u*MR, b_ptr + (size_t)u*NR);
+      a_ptr += (size_t)UNROLL*MR; b_ptr += (size_t)UNROLL*NR;
+    }
+    for(; k<Kc; ++k){ k_step(a_ptr,b_ptr); a_ptr+=MR; b_ptr+=NR; }
+
+    if(nr_eff==NR){
+#pragma unroll
+      for(int r=0;r<MR;++r){
+        float* c = C + (size_t)r*ldc;
+        __m512 c0 = aligned64(c)? _mm512_load_ps (c+ 0) : _mm512_loadu_ps(c+ 0);
+        __m512 c1 = aligned64(c)? _mm512_load_ps (c+16) : _mm512_loadu_ps(c+16);
+        __m512 c2 = aligned64(c)? _mm512_load_ps (c+32) : _mm512_loadu_ps(c+32);
+        c0 = _mm512_add_ps(c0, acc0[r]); c1 = _mm512_add_ps(c1, acc1[r]); c2 = _mm512_add_ps(c2, acc2[r]);
+        if(aligned64(c)){
+          _mm512_store_ps (c+ 0, c0); _mm512_store_ps (c+16, c1); _mm512_store_ps (c+32, c2);
+        }else{
+          _mm512_storeu_ps(c+ 0, c0); _mm512_storeu_ps(c+16, c1); _mm512_storeu_ps(c+32, c2);
+        }
+      }
+    }else{
+      __mmask16 m0,m1,m2; nr_masks(nr_eff,m0,m1,m2);
+      for(int r=0;r<MR;++r){
+        float* c = C + (size_t)r*ldc;
+        __m512 c0 = _mm512_maskz_loadu_ps(m0, c+ 0);
+        __m512 c1 = _mm512_maskz_loadu_ps(m1, c+16);
+        __m512 c2 = _mm512_maskz_loadu_ps(m2, c+32);
+        c0 = _mm512_add_ps(c0, acc0[r]); c1 = _mm512_add_ps(c1, acc1[r]); c2 = _mm512_add_ps(c2, acc2[r]);
+        _mm512_mask_storeu_ps(c+ 0, m0, c0);
+        _mm512_mask_storeu_ps(c+16, m1, c1);
+        _mm512_mask_storeu_ps(c+32, m2, c2);
       }
     }
-#pragma unroll
-    for(int u=0; u<UNROLL; ++u){
-      k_step(a_ptr + (size_t)u*MR, b_ptr + (size_t)u*NR);
-    }
-    a_ptr += (size_t)UNROLL*MR;
-    b_ptr += (size_t)UNROLL*NR;
-  }
-  for(; k<Kc; ++k){
-    k_step(a_ptr, b_ptr);
-    a_ptr += MR; b_ptr += NR;
+    return;
   }
 
-  if(mr_eff==MR && nr_eff==NR){
-#pragma unroll
-    for(int r=0;r<MR;++r){
+  // Thin path (mr_eff < MR)
+  __m512 acc0[MR], acc1[MR], acc2[MR];
+  for(int r=0;r<mr_eff;++r){ acc0[r]=_mm512_setzero_ps(); acc1[r]=_mm512_setzero_ps(); acc2[r]=_mm512_setzero_ps(); }
+  const float* a_ptr = Ap; const float* b_ptr = Bp;
+  int k=0, kend = Kc - (Kc % UNROLL);
+  auto k_step_thin = [&](const float* a, const float* b){
+    __m512 b0=_mm512_load_ps(b+ 0), b1=_mm512_load_ps(b+16), b2=_mm512_load_ps(b+32);
+    for(int r=0;r<mr_eff;++r){ __m512 ar=_mm512_set1_ps(a[r]);
+      acc0[r]=_mm512_fmadd_ps(ar,b0,acc0[r]);
+      acc1[r]=_mm512_fmadd_ps(ar,b1,acc1[r]);
+      acc2[r]=_mm512_fmadd_ps(ar,b2,acc2[r]); }
+  };
+  for(; k<kend; k+=UNROLL){
+    if(PFD>0){ int kp=k+PFD; if(kp<Kc){
+      _mm_prefetch((const char*)(Ap+(size_t)kp*MR), _MM_HINT_T0);
+      _mm_prefetch((const char*)(Bp+(size_t)kp*NR), _MM_HINT_T0); } }
+    for(int u=0; u<UNROLL; ++u) k_step_thin(a_ptr + (size_t)u*MR, b_ptr + (size_t)u*NR);
+    a_ptr += (size_t)UNROLL*MR; b_ptr += (size_t)UNROLL*NR;
+  }
+  for(; k<Kc; ++k){ k_step_thin(a_ptr,b_ptr); a_ptr+=MR; b_ptr+=NR; }
+
+  if(nr_eff==NR){
+    for(int r=0;r<mr_eff;++r){
       float* c = C + (size_t)r*ldc;
       __m512 c0 = aligned64(c)? _mm512_load_ps (c+ 0) : _mm512_loadu_ps(c+ 0);
       __m512 c1 = aligned64(c)? _mm512_load_ps (c+16) : _mm512_loadu_ps(c+16);
       __m512 c2 = aligned64(c)? _mm512_load_ps (c+32) : _mm512_loadu_ps(c+32);
-      c0 = _mm512_add_ps(c0, acc0[r]);
-      c1 = _mm512_add_ps(c1, acc1[r]);
-      c2 = _mm512_add_ps(c2, acc2[r]);
+      c0 = _mm512_add_ps(c0, acc0[r]); c1 = _mm512_add_ps(c1, acc1[r]); c2 = _mm512_add_ps(c2, acc2[r]);
       if(aligned64(c)){
-        _mm512_store_ps (c+ 0, c0);
-        _mm512_store_ps (c+16, c1);
-        _mm512_store_ps (c+32, c2);
+        _mm512_store_ps (c+ 0, c0); _mm512_store_ps (c+16, c1); _mm512_store_ps (c+32, c2);
       }else{
-        _mm512_storeu_ps(c+ 0, c0);
-        _mm512_storeu_ps(c+16, c1);
-        _mm512_storeu_ps(c+32, c2);
+        _mm512_storeu_ps(c+ 0, c0); _mm512_storeu_ps(c+16, c1); _mm512_storeu_ps(c+32, c2);
       }
     }
   }else{
@@ -259,9 +306,7 @@ static inline void micro_8x48_accum_u(const float* __restrict Ap,
       __m512 c0 = _mm512_maskz_loadu_ps(m0, c+ 0);
       __m512 c1 = _mm512_maskz_loadu_ps(m1, c+16);
       __m512 c2 = _mm512_maskz_loadu_ps(m2, c+32);
-      c0 = _mm512_add_ps(c0, acc0[r]);
-      c1 = _mm512_add_ps(c1, acc1[r]);
-      c2 = _mm512_add_ps(c2, acc2[r]);
+      c0 = _mm512_add_ps(c0, acc0[r]); c1 = _mm512_add_ps(c1, acc1[r]); c2 = _mm512_add_ps(c2, acc2[r]);
       _mm512_mask_storeu_ps(c+ 0, m0, c0);
       _mm512_mask_storeu_ps(c+16, m1, c1);
       _mm512_mask_storeu_ps(c+32, m2, c2);
@@ -289,12 +334,11 @@ static MicroAccum kAcTable[kNumCand] = {
   micro_accum_entry<4>, micro_accum_entry<6>, micro_accum_entry<8>
 };
 
-// one-shot UNROLL picker (same safe buffer sizing/indexing)
+// one-shot UNROLL picker
 static std::atomic<int> g_unroll_idx{-1};
 static inline int pick_unroll_once_idx(int Kc_for_test){
-  int tune   = env_int("SGEMM_TUNE", 1);
   int forceU = env_int("SGEMM_U", 0);
-  if(tune==0 && forceU>0){
+  if(forceU>0){
     for(int i=0;i<kNumCand;++i) if(kCand[i]==forceU){ g_unroll_idx.store(i); return i; }
   }
   int already = g_unroll_idx.load();
@@ -324,10 +368,7 @@ static inline int pick_unroll_once_idx(int Kc_for_test){
   };
 
   int best_i = 0; double best_t = 1e100;
-  for(int i=0;i<kNumCand;++i){
-    double t = bench(i);
-    if(t < best_t){ best_t = t; best_i = i; }
-  }
+  for(int i=0;i<kNumCand;++i){ double t = bench(i); if(t < best_t){ best_t = t; best_i = i; } }
   aligned_free64(Ap); aligned_free64(Bp); aligned_free64(C);
   g_unroll_idx.store(best_i);
   return best_i;
@@ -347,12 +388,10 @@ void sgemm_blocked(const float* A, int M, int K,
 #pragma omp parallel for schedule(static)
     for(int i=0;i<M;++i){
       float* Crow = C + (size_t)i*ldC;
-      if(beta==0.0f) std::memset(Crow, 0, sizeof(float)*N);
-      else if(beta!=1.0f) for(int j=0;j<N;++j) Crow[j]*=beta;
+      std::memset(Crow, 0, sizeof(float)*N);
     }
     return;
   }
-
   if(beta!=0.0f){
 #pragma omp parallel for schedule(static)
     for(int i=0;i<M;++i){
@@ -364,40 +403,25 @@ void sgemm_blocked(const float* A, int M, int K,
     return;
   }
 
-  // ---- Tunables (env) ----
+  // ---- Tunables ----
   const auto tiles = gemm::pick_tiles_avx512(M, N, K, /*dtype_bytes=*/4);
-  int MC = tiles.MC;
-  int KC = tiles.KC;
-  int NC = tiles.NC;
+  int MC = std::max(MR, tiles.MC);
+  int KC = std::max(1,  tiles.KC);
+  int NC = std::max(NR, std::min(tiles.NC, N));
 
-  // std::cout << "MC: " << MC << std::endl;
-  // std::cout << "KC: " << KC << std::endl;
-  // std::cout << "NC: " << NC << std::endl;
+  // Shared buffers that must be visible to all threads
+  float* Bp_buf = nullptr;   // size: KC * round_up(NC,NR)
+  float* Ap_shr = nullptr;   // small-M only; size: MT*Kc*MR (per K-panel)
 
-  MC = std::max(MR, MC);
-  KC = std::max(1,  KC);
-  NC = std::max(NR, std::min(NC, N));
-
-  // Pick UNROLL once based on representative Kc
-  int kc_test = std::min(KC, K);
-  int uidx = pick_unroll_once_idx(kc_test);
-  // std::cout << "Unroll idx: " << uidx << std::endl;
-  MicroOverwrite micro_overwrite = kOwTable[uidx];
-  MicroAccum    micro_accum     = kAcTable[uidx];
-
-  // Shared B-pack buffers (two are fine though we use one per panel now)
   const int NC_round_cols = ((NC + NR - 1)/NR)*NR;
-  float* Bp_buf = nullptr;
 
 #pragma omp parallel
   {
-    // Per-thread A pack buffer: max MC×KC floats
+    // Per-thread A pack for tall-M path
     float* Ap_thr = aligned_alloc64((size_t)MC * (size_t)KC);
 
 #pragma omp single
-    {
-      Bp_buf = aligned_alloc64((size_t)KC * (size_t)NC_round_cols);
-    }
+    { Bp_buf = aligned_alloc64((size_t)KC * (size_t)NC_round_cols); }
 #pragma omp barrier
 
     for(int jc=0; jc<N; jc+=NC){
@@ -408,7 +432,7 @@ void sgemm_blocked(const float* A, int M, int K,
         const int Kc = std::min(KC, K - k0);
         const bool is_last_panel = (k0 + Kc >= K);
 
-        // ---- Parallel B-pack for this (jc,k0) panel ----
+        // Pack B for this (jc,k0) panel
 #pragma omp for schedule(static)
         for(int tn=0; tn<NT; ++tn){
           const int j0     = jc + tn*NR;
@@ -418,20 +442,60 @@ void sgemm_blocked(const float* A, int M, int K,
           pack_B_tile_Knr(B_src, ldB, Kc, nr_eff, B_dst);
         }
 
-        // ---- Compute over IC blocks (each thread packs A(ic,k0) once) ----
+        // Strategy: small-M if there's only one ic-block (M ≤ MC)
+        const int num_ic_blocks = (M + MC - 1) / MC;
+        const bool smallM_mode  = (num_ic_blocks <= 1);
+
+        if (!smallM_mode) {
+          // Tall-M: parallelize over ic
 #pragma omp for schedule(static)
-        for(int ic=0; ic<M; ic+=MC){
-          const int mc = std::min(MC, M - ic);
+          for(int ic=0; ic<M; ic+=MC){
+            const int mc = std::min(MC, M - ic);
+            const int MT = (mc + MR - 1)/MR;
+
+            pack_A_block_mcxKc(A + (size_t)ic*ldA + k0, ldA, mc, Kc, alpha, Ap_thr);
+
+            for(int tm=0; tm<MT; ++tm){
+              const int r_off   = ic + tm*MR;
+              const int mr_here = std::min(MR, M - r_off);
+              const float* Ap_t = Ap_thr + (size_t)tm*Kc*MR;
+
+              for(int tn=0; tn<NT; ++tn){
+                const int j0      = jc + tn*NR;
+                const int nr_eff  = std::min(NR, N - j0);
+                const float* Bp_t = Bp_buf + (size_t)tn*Kc*NR;
+                float* C_tile     = C + (size_t)r_off*ldC + j0;
+
+                if(k0==0){
+                  const bool stream_ok = (is_last_panel && mr_here==MR && nr_eff==NR && aligned64(C_tile));
+                  micro_8x48_overwrite_u<4>(Ap_t, Bp_t, C_tile, ldC, Kc, mr_here, nr_eff, stream_ok); // UNROLL picked later
+                }else{
+                  micro_8x48_accum_u<4>(Ap_t, Bp_t, C_tile, ldC, Kc, mr_here, nr_eff);
+                }
+              }
+            }
+          } // ic
+        } else {
+          // Small-M: pack A once (shared), parallelize over (tn, tm)
+#pragma omp single
+          {
+            const int mc = M;                         // we only have one ic-block
+            const int MT = (mc + MR - 1)/MR;
+            Ap_shr = aligned_alloc64((size_t)MT * (size_t)Kc * (size_t)MR);  // <- correct size
+            pack_A_block_mcxKc(A + k0, ldA, mc, Kc, alpha, Ap_shr);
+          }
+#pragma omp barrier
+
+          const int mc = M;
           const int MT = (mc + MR - 1)/MR;
 
-          pack_A_block_mcxKc(A + (size_t)ic*ldA + k0, ldA, mc, Kc, alpha, Ap_thr);
+#pragma omp for collapse(2) schedule(static)
+          for(int tn=0; tn<NT; ++tn){
+            for(int tm=0; tm<MT; ++tm){
+              const int r_off   = tm*MR;
+              const int mr_here = std::min(MR, M - r_off);
+              const float* Ap_t = Ap_shr + (size_t)tm*Kc*MR;
 
-          for(int tm=0; tm<MT; ++tm){
-            const int r_off   = ic + tm*MR;
-            const int mr_here = std::min(MR, M - r_off);
-            const float* Ap_t = Ap_thr + (size_t)tm*Kc*MR;
-
-            for(int tn=0; tn<NT; ++tn){
               const int j0      = jc + tn*NR;
               const int nr_eff  = std::min(NR, N - j0);
               const float* Bp_t = Bp_buf + (size_t)tn*Kc*NR;
@@ -439,21 +503,24 @@ void sgemm_blocked(const float* A, int M, int K,
 
               if(k0==0){
                 const bool stream_ok = (is_last_panel && mr_here==MR && nr_eff==NR && aligned64(C_tile));
-                micro_overwrite(Ap_t, Bp_t, C_tile, ldC, Kc, mr_here, nr_eff, stream_ok);
+                micro_8x48_overwrite_u<4>(Ap_t, Bp_t, C_tile, ldC, Kc, mr_here, nr_eff, stream_ok);
               }else{
-                micro_accum(Ap_t, Bp_t, C_tile, ldC, Kc, mr_here, nr_eff);
+                micro_8x48_accum_u<4>(Ap_t, Bp_t, C_tile, ldC, Kc, mr_here, nr_eff);
               }
             }
           }
-        } // ic
+
+#pragma omp barrier
+#pragma omp single
+          { aligned_free64(Ap_shr); Ap_shr = nullptr; }
+#pragma omp barrier
+        } // smallM_mode
       } // k0
     }   // jc
 
     aligned_free64(Ap_thr);
 #pragma omp single
-    {
-      aligned_free64(Bp_buf);
-    }
+    { aligned_free64(Bp_buf); Bp_buf = nullptr; }
   } // omp parallel
 }
 
