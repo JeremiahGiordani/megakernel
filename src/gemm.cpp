@@ -384,14 +384,19 @@ void sgemm_blocked(const float* A, int M, int K,
 
   const int ldA = K, ldB = N, ldC = N;
 
+  // alpha=0 => just scale/zero C and return (unchanged from your code)
   if(alpha==0.0f){
 #pragma omp parallel for schedule(static)
     for(int i=0;i<M;++i){
       float* Crow = C + (size_t)i*ldC;
-      std::memset(Crow, 0, sizeof(float)*N);
+      if(beta==0.0f) std::memset(Crow, 0, sizeof(float)*N);
+      else if(beta!=1.0f) for(int j=0;j<N;++j) Crow[j]*=beta;
     }
     return;
   }
+
+  // Keep your existing slow path for beta!=0 (unchanged).
+  // If you later want a fast epilogue with beta!=0, we can add it.
   if(beta!=0.0f){
 #pragma omp parallel for schedule(static)
     for(int i=0;i<M;++i){
@@ -403,36 +408,95 @@ void sgemm_blocked(const float* A, int M, int K,
     return;
   }
 
-  // ---- Tunables ----
+  // ---- Tunables (env / autotuner) ----
   const auto tiles = gemm::pick_tiles_avx512(M, N, K, /*dtype_bytes=*/4);
   int MC = std::max(MR, tiles.MC);
   int KC = std::max(1,  tiles.KC);
   int NC = std::max(NR, std::min(tiles.NC, N));
 
-  // Shared buffers that must be visible to all threads
-  float* Bp_buf = nullptr;   // size: KC * round_up(NC,NR)
-  float* Ap_shr = nullptr;   // small-M only; size: MT*Kc*MR (per K-panel)
+  // Pick UNROLL once based on representative Kc
+  int kc_test = std::min(KC, K);
+  int uidx = pick_unroll_once_idx(kc_test);
+  MicroOverwrite micro_overwrite = kOwTable[uidx];
+  MicroAccum    micro_accum     = kAcTable[uidx];
 
+  // Round NC to NR so scratch & B-pack have contiguous 3×16 lanes per row.
   const int NC_round_cols = ((NC + NR - 1)/NR)*NR;
+
+  // Helper lambdas: zero a (mc x ldc_p) block in scratch; epilogue store to C
+  auto zero_scratch_rows = [&](float* Cp, int mc, int ldc_p){
+    // Zero mc rows × ldc_p columns (contiguous per row).
+    // Each row is ldc_p floats; do a single memset over the full rectangle.
+    std::memset(Cp, 0, sizeof(float)*(size_t)mc*(size_t)ldc_p);
+  };
+
+  auto store_from_scratch = [&](const float* Cp, int ldc_p,
+                                float* Cdst, int ldc_dst,
+                                int mr_eff, int nr_eff, bool stream_ok_full){
+    if(mr_eff==MR && nr_eff==NR){
+      // fast path: full 8x48 tile
+#pragma unroll
+      for(int r=0;r<MR;++r){
+        float* c = Cdst + (size_t)r*ldc_dst;
+        const float* s = Cp + (size_t)r*ldc_p;
+        __m512 x0 = _mm512_load_ps(s+ 0);
+        __m512 x1 = _mm512_load_ps(s+16);
+        __m512 x2 = _mm512_load_ps(s+32);
+        if(stream_ok_full && aligned64(c)){
+          _mm512_stream_ps(c+ 0, x0);
+          _mm512_stream_ps(c+16, x1);
+          _mm512_stream_ps(c+32, x2);
+        }else{
+          if(aligned64(c)){
+            _mm512_store_ps (c+ 0, x0);
+            _mm512_store_ps (c+16, x1);
+            _mm512_store_ps (c+32, x2);
+          }else{
+            _mm512_storeu_ps(c+ 0, x0);
+            _mm512_storeu_ps(c+16, x1);
+            _mm512_storeu_ps(c+32, x2);
+          }
+        }
+      }
+    }else{
+      // tail path: masked stores for partial NR and/or MR
+      __mmask16 m0,m1,m2; nr_masks(nr_eff,m0,m1,m2);
+      for(int r=0;r<mr_eff;++r){
+        float* c = Cdst + (size_t)r*ldc_dst;
+        const float* s = Cp   + (size_t)r*ldc_p;
+        __m512 x0 = _mm512_maskz_loadu_ps(m0, s+ 0);
+        __m512 x1 = _mm512_maskz_loadu_ps(m1, s+16);
+        __m512 x2 = _mm512_maskz_loadu_ps(m2, s+32);
+        _mm512_mask_storeu_ps(c+ 0, m0, x0);
+        _mm512_mask_storeu_ps(c+16, m1, x1);
+        _mm512_mask_storeu_ps(c+32, m2, x2);
+      }
+    }
+  };
+
+  float* Bp_buf = nullptr;
 
 #pragma omp parallel
   {
-    // Per-thread A pack for tall-M path
+    // Per-thread buffers
     float* Ap_thr = aligned_alloc64((size_t)MC * (size_t)KC);
+    float* Cp_thr = aligned_alloc64((size_t)MC * (size_t)NC_round_cols);
 
 #pragma omp single
-    { Bp_buf = aligned_alloc64((size_t)KC * (size_t)NC_round_cols); }
+    {
+      Bp_buf = aligned_alloc64((size_t)KC * (size_t)NC_round_cols);
+    }
 #pragma omp barrier
 
     for(int jc=0; jc<N; jc+=NC){
       const int nc = std::min(NC, N - jc);
-      const int NT = (nc + NR - 1)/NR;
+      const int NT = (nc + NR - 1)/NR;   // number of NR-sized tiles across this nc
+      const int ldc_p = NC_round_cols;   // leading dimension for scratch
 
       for(int k0=0; k0<K; k0+=KC){
         const int Kc = std::min(KC, K - k0);
-        const bool is_last_panel = (k0 + Kc >= K);
 
-        // Pack B for this (jc,k0) panel
+        // ---- Parallel B-pack for this (jc,k0) panel (unchanged) ----
 #pragma omp for schedule(static)
         for(int tn=0; tn<NT; ++tn){
           const int j0     = jc + tn*NR;
@@ -442,86 +506,82 @@ void sgemm_blocked(const float* A, int M, int K,
           pack_B_tile_Knr(B_src, ldB, Kc, nr_eff, B_dst);
         }
 
-        // Strategy: small-M if there's only one ic-block (M ≤ MC)
-        const int num_ic_blocks = (M + MC - 1) / MC;
-        const bool smallM_mode  = (num_ic_blocks <= 1);
-
-        if (!smallM_mode) {
-          // Tall-M: parallelize over ic
+        // ---- Compute over IC blocks (each thread keeps C' hot) ----
 #pragma omp for schedule(static)
-          for(int ic=0; ic<M; ic+=MC){
-            const int mc = std::min(MC, M - ic);
-            const int MT = (mc + MR - 1)/MR;
+        for(int ic=0; ic<M; ic+=MC){
+          const int mc = std::min(MC, M - ic);
+          const int MT = (mc + MR - 1)/MR;
 
-            pack_A_block_mcxKc(A + (size_t)ic*ldA + k0, ldA, mc, Kc, alpha, Ap_thr);
+          // For the *first* K-panel touching this (ic,jc), zero the scratch once.
+          // We detect "first panel" by k0==0.
+          if(k0==0){
+            zero_scratch_rows(Cp_thr, mc, ldc_p);
+          }
 
+          // Pack A(ic,k0) once for this thread
+          pack_A_block_mcxKc(A + (size_t)ic*ldA + k0, ldA, mc, Kc, alpha, Ap_thr);
+
+          // Walk microtiles; write partial sums into C' (scratch)
+          for(int tm=0; tm<MT; ++tm){
+            const int r_off   = ic + tm*MR;
+            const int mr_here = std::min(MR, M - r_off);
+            const float* Ap_t = Ap_thr + (size_t)tm*Kc*MR;
+
+            for(int tn=0; tn<NT; ++tn){
+              const int j0      = jc + tn*NR;
+              const int nr_eff  = std::min(NR, N - j0);
+              const float* Bp_t = Bp_buf + (size_t)tn*Kc*NR;
+
+              // Pointer into scratch for this microtile
+              float* Cprime_tile = Cp_thr + (size_t)tm*ldc_p*MR + tn*NR;
+
+              // On first panel for this (ic,jc) tile, overwrite into zeroed C';
+              // on subsequent panels, accumulate into C'.
+              if(k0==0){
+                // stream flag irrelevant for scratch; use false
+                micro_overwrite(Ap_t, Bp_t, Cprime_tile, ldc_p, Kc, mr_here, nr_eff, /*stream_last_panel=*/false);
+              }else{
+                micro_accum    (Ap_t, Bp_t, Cprime_tile, ldc_p, Kc, mr_here, nr_eff);
+              }
+            } // tn
+          }   // tm
+
+          // If this was the last K-panel, do the *single* epilogue write C' -> C
+          const bool is_last_panel = (k0 + Kc >= K);
+          if(is_last_panel){
             for(int tm=0; tm<MT; ++tm){
               const int r_off   = ic + tm*MR;
               const int mr_here = std::min(MR, M - r_off);
-              const float* Ap_t = Ap_thr + (size_t)tm*Kc*MR;
 
               for(int tn=0; tn<NT; ++tn){
                 const int j0      = jc + tn*NR;
                 const int nr_eff  = std::min(NR, N - j0);
-                const float* Bp_t = Bp_buf + (size_t)tn*Kc*NR;
-                float* C_tile     = C + (size_t)r_off*ldC + j0;
 
-                if(k0==0){
-                  const bool stream_ok = (is_last_panel && mr_here==MR && nr_eff==NR && aligned64(C_tile));
-                  micro_8x48_overwrite_u<4>(Ap_t, Bp_t, C_tile, ldC, Kc, mr_here, nr_eff, stream_ok); // UNROLL picked later
-                }else{
-                  micro_8x48_accum_u<4>(Ap_t, Bp_t, C_tile, ldC, Kc, mr_here, nr_eff);
-                }
-              }
-            }
-          } // ic
-        } else {
-          // Small-M: pack A once (shared), parallelize over (tn, tm)
-#pragma omp single
-          {
-            const int mc = M;                         // we only have one ic-block
-            const int MT = (mc + MR - 1)/MR;
-            Ap_shr = aligned_alloc64((size_t)MT * (size_t)Kc * (size_t)MR);  // <- correct size
-            pack_A_block_mcxKc(A + k0, ldA, mc, Kc, alpha, Ap_shr);
-          }
-#pragma omp barrier
+                const float* Cprime_tile = Cp_thr + (size_t)tm*ldc_p*MR + tn*NR;
+                float*       C_tile      = C      + (size_t)r_off*ldC    + j0;
 
-          const int mc = M;
-          const int MT = (mc + MR - 1)/MR;
+                // For full, aligned tiles we can stream on this *final* write.
+                const bool stream_ok_full =
+                  (mr_here==MR && nr_eff==NR && aligned64(C_tile));
 
-#pragma omp for collapse(2) schedule(static)
-          for(int tn=0; tn<NT; ++tn){
-            for(int tm=0; tm<MT; ++tm){
-              const int r_off   = tm*MR;
-              const int mr_here = std::min(MR, M - r_off);
-              const float* Ap_t = Ap_shr + (size_t)tm*Kc*MR;
-
-              const int j0      = jc + tn*NR;
-              const int nr_eff  = std::min(NR, N - j0);
-              const float* Bp_t = Bp_buf + (size_t)tn*Kc*NR;
-              float* C_tile     = C + (size_t)r_off*ldC + j0;
-
-              if(k0==0){
-                const bool stream_ok = (is_last_panel && mr_here==MR && nr_eff==NR && aligned64(C_tile));
-                micro_8x48_overwrite_u<4>(Ap_t, Bp_t, C_tile, ldC, Kc, mr_here, nr_eff, stream_ok);
-              }else{
-                micro_8x48_accum_u<4>(Ap_t, Bp_t, C_tile, ldC, Kc, mr_here, nr_eff);
-              }
-            }
-          }
-
-#pragma omp barrier
-#pragma omp single
-          { aligned_free64(Ap_shr); Ap_shr = nullptr; }
-#pragma omp barrier
-        } // smallM_mode
-      } // k0
-    }   // jc
+                store_from_scratch(Cprime_tile, ldc_p,
+                                   C_tile,       ldC,
+                                   mr_here, nr_eff, stream_ok_full);
+              } // tn
+            }   // tm
+          }     // epilogue
+        }       // ic
+      }         // k0
+    }           // jc
 
     aligned_free64(Ap_thr);
+    aligned_free64(Cp_thr);
 #pragma omp single
-    { aligned_free64(Bp_buf); Bp_buf = nullptr; }
+    {
+      aligned_free64(Bp_buf);
+    }
   } // omp parallel
 }
+
 
 } // namespace gemm
